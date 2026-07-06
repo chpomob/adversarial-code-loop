@@ -459,6 +459,33 @@ a stdin concatenation.
 - `references/claude-p-migration-pattern.md`, `references/wrapper-failures.md` — Claude wrapper notes
 - Smit et al. (ICML 2024) "Should we be going MAD?"; Du et al. (ICML 2024)
 
+## Retrospective logging
+
+Every pipeline failure is automatically logged to `_retrospective/ISSUES.md` with:
+
+- Phase name, branch, error message, and last 200 chars of stdout
+- Date/time of failure
+- Feature name from the spec
+
+Review issues before planning v5:
+
+```bash
+cat ~/.hermes/skills/adversarial-code-loop/_retrospective/ISSUES.md
+```
+
+To manually add a note about a limitation you noticed, add an entry at the top of
+`_retrospective/ISSUES.md` following the same format:
+
+```markdown
+### YYYY-MM-DD — Short title
+
+- **Model combo:** GLM/DeepSeek/Claude/Codex + (role)
+- **Symptom:** What went wrong
+- **Root cause:** Why it happened
+- **Fix/workaround:** How you worked around it
+- **Would fix in v5 by:** Concrete design change
+```
+
 ## Changelog
 
 - **v4.0.0** (2026-07-06): git-native rewrite. Branch-per-loop isolation, commit-based

@@ -87,3 +87,11 @@ Add a new entry at the top:
 - **Root cause:** The state.json format evolved during development but backward compatibility wasn't maintained.
 - **Fix/workaround:** Added fallback lookups and error paths. Documented "only resume from the same v4 version that wrote the state."
 - **Would fix in v5 by:** Versioned state schema. `state.version` field used for migration/compatibility checks.
+
+### 2026-07-06 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/acl-spec-mi5q/1
+- **Error:** DEV exited 124: TIMEOUT after 1s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**

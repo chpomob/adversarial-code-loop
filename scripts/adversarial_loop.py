@@ -168,11 +168,38 @@ def _unresolved(findings, results):
     return [f for f in findings if f.get("id") not in settled]
 
 
+def _log_retrospective(label, result, state, out_dir):
+    """Log a pipeline failure to the retrospective tracker."""
+    import json, os, datetime
+    retrodir = os.path.expanduser("~/.hermes/skills/adversarial-code-loop/_retrospective")
+    os.makedirs(retrodir, exist_ok=True)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    feature = state.get("feature", "unknown")
+    branch = state.get("branch", "")
+    error = result.get("error", "unknown error")
+    stdout = result.get("stdout", "")
+    entry = (
+        f"\n### {now.split()[0]} — {label} failed for {feature}\n\n"
+        f"- **Phase:** {label}\n"
+        f"- **Branch:** {branch}\n"
+        f"- **Error:** {error}\n"
+        f"- **Stdout (last 200 chars):** {stdout[-200:]!r}\n"
+        f"- **Auto-logged by pipeline**\n"
+    )
+    issues_file = os.path.join(retrodir, "ISSUES.md")
+    with open(issues_file, "a") as f:
+        f.write(entry)
+
+
 def _phase_failed(label, result, state, out_dir):
     """Log a phase failure into state.json and stdout. Returns EXIT_INFRA."""
     state["error"] = f"{label}: {result.get('error', 'unknown error')}"
     _mark(state, out_dir, f"{label}_failed")
     print(f"X {label} failed: {result.get('error', 'unknown error')}")
+    try:
+        _log_retrospective(label, result, state, out_dir)
+    except Exception as exc:
+        print(f"! could not write retrospective log: {exc}")
     return EXIT_INFRA
 
 
