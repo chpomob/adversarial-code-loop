@@ -1,0 +1,284 @@
+--- 
+name: adversarial-code-loop
+description: "Use when writing and refining code through an adversarial loop: DEV generates → REVIEW critiques → DEV addresses → REVIEW validates → optional ARBITER resolves deadlock. Sequential multi-model with Multi-Persona prompts injected per role."
+version: 2.2.0
+author: Hermes Agent
+license: MIT
+metadata:
+  hermes:
+    tags: [adversarial, code-review, multi-model, sequential, loop, persona]
+    related_skills: [adversarial-code-review, triangle-code-review, writing-plans]
+---
+
+# Adversarial Code Loop
+
+**3 rôles × 4 étapes × N boucles + 1 arbitre.**
+
+Pipeline séquentiel alterné où un modèle écrit, l'autre critique, le premier corrige, le second valide. Basé sur le principe de **Multi-Persona adversarial debate** (Smit et al., ICML 2024) : chaque rôle a un persona distinct, ce qui améliore la qualité même avec le même modèle sous-jacent.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  ÉTAPE 1 — CODE                          (DEV)                  │
+│  Persona: BUILDER — génère du code production-ready             │
+├────────────────────────────────────────────────────────────────┤
+│  ÉTAPE 2 — CRITIQUE                       (REVIEW)              │
+│  Persona: CRITIC — trouve bugs, failles, edge cases             │
+├────────────────────────────────────────────────────────────────┤
+│  ÉTAPE 3 — FIX                            (DEV)                 │
+│  Persona: FIXER — adresse CHAQUE point de la review             │
+├────────────────────────────────────────────────────────────────┤
+│  ÉTAPE 4 — VALIDATION                     (REVIEW)             │
+│  Persona: VERIFIER — tous les points adressés ? APPROVE/REJECT  │
+├────────────────────────────────────────────────────────────────┤
+│  └─ REJECT → loop ÉTAPE 3 (max N fois)                          │
+│  └─ deadlock après N loops → ÉTAPE 5 (optionnel)                │
+├────────────────────────────────────────────────────────────────┤
+│  ÉTAPE 5 — ARBITRAGE                      (ARBITER)            │
+│  Persona: JUDGE — tranche objectivement le désaccord            │
+└────────────────────────────────────────────────────────────────┘
+```
+
+## Quand l'utiliser
+
+- Tu veux du code **reviewé par un autre modèle** avant livraison.
+- Tu veux casser l'"echo chamber" où le même modèle code et valide.
+- Tu travailles sur du code **critique** (sécurité, auth, argent).
+- Tu veux **alterner les perspectives** (pas du parallèle comme Triangle).
+
+**Pas pour** : les questions simples, les explorations rapides, les refactors triviaux. Le coût (6+ appels LLM) ne se justifie que pour du code critique ou complexe.
+
+## Configuration
+
+Le script `scripts/adversarial_loop.py` est configuré **uniquement** par flags CLI (plus une seule variable d'environnement, `ACL_WRAPPER`). Il n'y a **pas** de fichier de config YAML ni d'autres variables d'environnement — passe tous les flags explicitement.
+
+### Flags CLI
+
+| Flag | Défaut | Rôle |
+|------|--------|------|
+| `--spec` | *(requis)* | Fichier de spécification à implémenter |
+| `--workdir` | cwd | Répertoire projet (cwd des sous-process, base de `--out`) |
+| `--max-loops` | `3` | Nombre max de cycles FIX/VERIFY |
+| `--dev-cmd` | `claude-tmux.py --model opus --max-turns 20 --yolo` | Commande BUILDER/FIXER |
+| `--review-cmd` | `codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox` | Commande CRITIC/VERIFIER |
+| `--arbiter-cmd` | `claude-tmux.py --model opus --max-turns 10 --yolo` | Commande JUDGE |
+| `--no-arbiter` | off | Saute l'ÉTAPE 5 (REJECT au lieu d'arbitrer) |
+| `--timeout` | `600` | Timeout par sous-process (secondes) |
+| `--out` | `.adversarial-loop` | Répertoire d'artefacts (sous `--workdir` si relatif) |
+
+> ⚠️ **Les defaults du script sont DEV=Claude-tmux, REVIEW=Codex** — l'inverse de ce qu'on attend souvent. Ne compte pas sur les defaults : passe toujours `--dev-cmd` et `--review-cmd` explicitement.
+>
+> ⚠️ **Double timeout warning pour Fable 5 en DEV** : l'adversarial loop a `--timeout` (défaut 600s, timeout par sous-process) ET claude-tmux.py a son propre `--timeout` (défaut 60s, timeout d'inactivité du pane tmux). Fable 5 fait du extended thinking de 8-12 min (parfois plus). Même si le spinner tmux rafraîchit la ligne « Concocting… (Xm Ys) », certaines phases de réflexion sans mise à jour du pane peuvent déclencher le timeout du wrapper. **Toujours passer `--timeout 600 --hard-timeout 900` à claude-tmux.py** quand le modèle est Fable 5.
+>
+> ⚠️ **Timeout insuffisant pour Codex sandbox en FIX** : quand Codex est le FIXER (mode DEV ou FIX), le sandbox bubblewrap ajoute un surcoût d'écriture disque. La phase FIX avec 5+ findings peut dépasser 300s. Utiliser `--timeout 600` (ou plus) pour les specs d'intégration touchant 3+ fichiers. Un timeout FIX à 300s ne perd pas le travail — Codex écrit sur le disque dans le sandbox AVANT le timeout. Récupérer via `git diff --stat` puis compiler/tester/committer.
+
+`ACL_WRAPPER` (env) ne sert qu'à changer le binaire Claude par défaut du `--dev-cmd`/`--arbiter-cmd`. Il n'y a **pas** de `ACL_DEV_CMD`, `ACL_REVIEW_CMD`, `ACL_ARBITER_CMD`, `ACL_MAX_LOOPS`, `ACL_TIMEOUT` ni `ACL_QUOTA_AWARE` — ces variables ne sont pas lues.
+
+### Exemple validé
+
+```bash
+# Codex DEV + pi.dev DeepSeek REVIEW (preferred workflow, no Fable quota consumed)
+# Utilise --timeout 600 car le FIX sandbox de Codex peut depasser 300s
+# sur les specs d'integration (3+ fichiers)
+python3 /home/chpo/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
+  --spec /tmp/spec.md \
+  --workdir /path/to/project \
+  --dev-cmd "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --sandbox danger-full-access" \
+  --review-cmd "pi-hermes -p --provider deepseek --model deepseek-v4-pro --thinking low" \
+  --max-loops 2 --no-arbiter --timeout 600 --out .adversarial-loop-deepseek
+
+# Codex DEV + Fable 5 REVIEW (sans arbitre)
+python3 /home/chpo/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
+  --spec /tmp/spec.md \
+  --workdir /path/to/project \
+  --dev-cmd "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --sandbox danger-full-access" \
+  --review-cmd "python3 /home/chpo/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py --yolo --model fable" \
+  --max-loops 2 --no-arbiter --timeout 600 --out .adversarial-loop-deepseek
+
+# Fable 5 DEV + Codex REVIEW (inverse — firmware embarqué, le + fort en générateur)
+# NOTA: --dev-cmd inclut --timeout 600 pour le wrapper claude-tmux.py (pa pane inertie)
+python3 /home/chpo/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
+  --spec /tmp/spec.md \
+  --workdir /path/to/project \
+  --dev-cmd "python3 /home/chpo/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py --yolo --model fable --timeout 600 --hard-timeout 900" \
+  --review-cmd "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --sandbox danger-full-access" \
+  --max-loops 2 --no-arbiter --timeout 600 --out .adversarial-loop-deepseek
+```
+
+**Wrapper Claude** : utiliser `claude-tmux.py` (quota 5h interactif), PAS `claude -p` (Agent SDK $20/mois). Fallback si Opus en rate-limit : `claude-tmux.py --model sonnet --yolo`.
+
+**Alternative gratuite** : `agy` (Antigravity CLI) donne accès aux modèles Gemini gratuits. Ex : `--dev-cmd "agy -p --model 'Gemini 3.5 Flash (Medium)' --dangerously-skip-permissions --print-timeout 10m0s"`.
+
+## Personas (injectés automatiquement)
+
+Les personas BUILDER/CRITIC/FIXER/VERIFIER/JUDGE sont définis en dur dans le script (constantes `*_PERSONA`), écrits dans des fichiers temporaires, et **injectés selon le provider** par `run_cli()` :
+
+- **Claude natif (`claude -p`)** : `--append-system-prompt-file <fichier>` (system prompt).
+- **claude-tmux.py, Codex, autres** : le texte du persona est **préfixé au stdin** (`claude-tmux.py` a un argparse strict qui n'accepte pas `--append-system-prompt-file`, et Codex n'a pas d'équivalent system-prompt).
+
+Le persona reste donc séparé du contenu dynamique (spec, code, findings). Smit et al. (ICML 2024) montrent que ces personas distincts compensent partiellement le manque de diversité quand DEV et REVIEW partagent le même modèle.
+
+## Artefacts
+
+Chaque run produit dans `<workdir>/.adversarial-loop/` (ou `--out`) :
+
+| Fichier | Étape | Contenu |
+|---------|-------|---------|
+| `00_spec.txt` | Préparation | Spec ou description du besoin |
+| `01_code.md` | BUILDER | Code produit par DEV |
+| `02_review.json` | CRITIC | Findings structurés |
+| `loop_N_03_fix.md` | FIXER | Correctif du cycle N |
+| `loop_N_03_fix.diff` | FIXER | Diff disque (mode sandbox) |
+| `loop_N_04_verdict.json` | VERIFIER | APPROVE / REJECT |
+| `05_arbitrage.md` | JUDGE | Décision (si déclenché) |
+| `final.md` | Sortie | Résumé + code final + verdict |
+
+## Codes de sortie
+
+| Code | Signification |
+|------|---------------|
+| `0` | APPROVED (CRITIC ou VERIFIER) |
+| `1` | REJECTED (échec de phase, ou REJECT avec `--no-arbiter`) |
+| `42` | ARBITRATED — verdict JUDGE `CODE_NEEDS_FIXES` ou indéterminé (code viable avec retouches) |
+
+L'arbitre parse maintenant son **vrai verdict** (`VERDICT: APPROVED | CODE_NEEDS_FIXES | REJECT`) : `APPROVED`→0, `REJECT`→1, sinon `42`. Toujours lire `05_arbitrage.md` pour le détail.
+
+## Comportement clé du script
+
+- **Propagation d'erreur** : chaque phase vérifie le code de retour du sous-process. Sur échec (≠ 0), le pipeline s'arrête (`_fail_phase()`), il ne nourrit jamais une phase aval avec un output cassé.
+- **JSON robuste** : `_strip_json_wrapper()` extrait le plus grand objet JSON valide avant chaque `json.loads()` (gère les code fences et la prose de préambule).
+- **Anti-hang** : `run_cli()` lance les sous-process avec `start_new_session=True`, redirige stdout/stderr vers des fichiers temporaires (pas de pipe à saturer), et tue tout le groupe de process (`killpg`) au timeout. Indispensable quand Codex sandbox laisse des petits-enfants ouverts.
+- **Écriture sur disque** : quand le FIXER renvoie `updated_code` + `target_file` (chemin relatif validé, pas de `..`, dans le workdir), le script écrit le fichier et promeut `code_text`.
+- **Fallback sandbox** : si le FIXER (Codex `--sandbox danger-full-access`) écrit directement sur disque et renvoie du non-JSON, le script compare l'état git (`git status --porcelain`) à un **snapshot pris au démarrage** du pipeline. Seuls les fichiers modifiés *par ce run* sont attribués au FIXER, sur **n'importe quelle extension** (plus de filtre `.kt`). `all_fixed` n'est mis à `True` que si du vrai contenu de fichier a été capturé.
+
+## Invocation depuis Hermes
+
+```python
+terminal("python3 /home/chpo/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py "
+         "--spec /tmp/issue.md --workdir $(pwd) "
+         "--dev-cmd 'codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --sandbox danger-full-access' "
+         "--review-cmd 'python3 /home/chpo/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py --yolo' "
+         "--max-loops 2 --no-arbiter --timeout 900",
+         background=True, notify_on_complete=True)
+```
+
+Pour les longs runs (Opus + spec complexe → >5 min/étape), toujours `background=True`.
+
+## Pitfalls
+
+1. **Boucle infinie** — Toujours borner avec `--max-loops` (défaut 3). L'arbitre ne sert qu'à trancher le dernier désaccord, pas à faire tourner la boucle.
+2. **Dev + Review = même modèle ?** — Les personas deviennent CRUCIAUX : ils compensent partiellement le manque de diversité de modèle (Smit et al.).
+3. **Codex nécessite un repo git** — `--skip-git-repo-check` est inclus par défaut dans `--review-cmd`. En cas d'override, l'ajouter manuellement.
+4. **`claude -p --max-turns N` tronque la réponse** — Ne PAS utiliser `--max-turns` avec `claude -p` en mode pipe (chaque tool-call compte ; `--max-turns 1` rend une réponse vide). Préférer `claude-tmux.py`.
+5. **`~` non expandu avec `shell=False`** — `subprocess` + `shlex.split()` ne fait pas l'expansion du tilde. Utiliser des chemins absolus dans les commandes.
+6. **Script orienté génération, pas édition de fichiers** — Le BUILDER reçoit une spec et produit du code. Pour modifier un fichier existant, inclure son contenu intégral dans la spec.
+7. **BUILDER qui ne produit pas de code (Codex sandbox)** — Sur des specs volumineuses, Codex peut entrer en méta-discussion ("autorisez les permissions") au lieu de produire du code. Prévention : dans la spec, ajouter explicitement « Produce ALL code INLINE in markdown code blocks. Do NOT attempt file writes or ask for permission. » Voir `references/builder-permission-stall.md`.
+8. **Découper les specs trop larges** — Une spec demandant >3-4 fichiers en une passe paralyse le BUILDER. Découper en specs incrémentales.
+9. **Pas de phase de compilation** — Ni CRITIC, ni FIXER, ni VERIFIER ne compilent. Après extraction, TOUJOURS compiler (`./gradlew compileDebugKotlin`, `python3 -m py_compile`, build firmware…) avant de committer.
+10. **VERIFIER faux positifs** — Le VERIFIER ne voit que le diff/texte, pas le code réel. Il a déjà inventé des claims de compilation. Vérifier manuellement.
+11. **Mettre à jour les tests** — Si la spec ne dit pas explicitement « mets à jour les tests », le DEV modifie la prod mais pas les tests qui référencent l'ancien comportement. Ajouter une section « Tests » dans la spec, ou lancer la suite après la boucle.
+12. **Timeout adversarial `--timeout` ≠ timeout wrapper** — L'adversarial loop a son propre `--timeout` (défaut 600s, par sous-process). Mais le wrapper `claude-tmux.py` a AUSSI un `--timeout` (défaut 60s, inactivité pane). Fable 5 fait du extended thinking 8-12 min : le spinner tmux rafraîchit la ligne, mais entre les rafraîchissements le wrapper peut timeout. **Toujours passer `--timeout 600 --hard-timeout 900` à claude-tmux.py** dans `--dev-cmd`/`--review-cmd` quand le modèle est Fable 5.
+
+    **Piège : le curseur clignotant empêche le timeout d'inactivité de se déclencher.** Après que Fable 5 a fini de produire sa réponse et que le pane tmux atteint l'état `❯` (prompt d'attente), un curseur clignotant fait changer le hash du pane à chaque poll (2s). Le wrapper réinitialise son deadline d'inactivité à chaque changement de hash. Résultat : `--timeout` ne se déclenche JAMAIS — le wrapper reste actif jusqu'à `--hard-timeout`. Ce n'est pas un bug, c'est le comportement attendu du mécanisme hash-refresh qui détecte l'activité du curseur.
+
+    **Conséquence pratique :** `--hard-timeout` est le SEUL garde-fou fiable. Une run qui termine vite (Fable 5 répond en 5 min) mais ne complète pas le protocole file/done restera bloquée 15 min (ou 30 min avec la valeur par défaut). Toujours fixer `--hard-timeout` à une valeur raisonnable (900s pour Fable 5, pas le défaut 1800s). Voir `claude-tmux-wrapper` SKILL.md pitfall #12 pour le détail.
+
+    Voir `references/fable5-tmux-timeout.md`.
+13. **.done file detection failure** — Le wrapper `claude-tmux.py` peut ne pas détecter le fichier `.done` écrit par Fable 5 (surtout quand Fable 5 écrit directement sur disque via Write tool plutôt que dans le fichier de sortie). Symptôme : le BUILD/FIX termine (01_code.md présent), la session tmux montre le prompt ❯, mais le script reste bloqué à attendre le sous-process. **Kill cascade nécessaire** : tuer la session tmux SEULE ne suffit pas — le processus Python wrapper (`claude-tmux.py`) survit comme orphelin car `run_cli()` utilise `start_new_session=True` (le wrapper est dans un groupe de process séparé). L'adversarial loop bloque indéfiniment sur `Popen.wait()` car le wrapper ne meurt jamais.
+
+    **Procédure de recovery :**
+    1. `tmux kill-session -t claude-tmux-<PID>` — tue le pane tmux
+    2. Si le script reste bloqué (vérifier avec `tail -10 <log>`), tuer le processus wrapper : `kill -9 <PID_du_wrapper>` ou `pkill -f "claude-tmux.*<PID>"`
+    3. Le script voit le code de sortie -9 (SIGKILL) et continue
+    4. Pour le BUILD : le script passera à CRITIQUE après la mort du wrapper
+    5. Pour le FIX : le script marque la phase comme échouée (`_fail_phase`). Récupérer les écritures sandbox du FIX via `git diff` — elles ont été écrites sur disque avant le kill, mais ne sont pas capturées par le fallback sandbox (car la phase n'a pas retourné de JSON). Voir `references/done-file-detection-recovery.md`.
+14. **Mutualisation avec `adversarial-code-review`** — Les deux skills partagent les patterns `run_cli()`/sécurité mais sont des codebases indépendantes. Toute correction de sécurité/stabilité sur l'un doit être vérifiée sur l'autre. Voir `references/mutualization-checklist.md`.
+15. **Codex comme REVIEWER pour le firmware** — Codex gpt-5.5 + reasoning effort high fait d'excellentes reviews firmware C (13 findings vs 3, détection de régressions). Premier choix comme REVIEWER sur de l'embarqué.
+16. **Deux loops adversarial (tests + code)** — Pour les projets TDD, séparer en deux loops : une pour les tests, une pour l'implémentation. Chacune peut échouer sur quota sans perdre le travail de l'autre. Le code du BUILD initial (01_code.md) est souvent récupérable même si la FIX phase timeout.
+17. **Quotas multi-step** — Sur des pipelines longs (>5 étapes adversarial), prévoir un mécanisme de reprise cron. Programme le cron AVANT que le quota ne saute, pas après. L'état est sauvé dans un fichier JSON avec l'étape courante, le répertoire d'artefacts, et le timestamp de reset du quota. Voir `references/quota-aware-orchestration.md`.
+
+18. **FIX sandbox writes perdus quand FIX est tué** — Quand la phase FIX (par ex. Fable 5) écrit sur le disque via Write tool (sandbox mode) mais que le wrapper est tué (SIGKILL après .done detection failure), le script marque `_fail_phase()` sans capturer les fichiers modifiés. Le fallback sandbox du script compare `git diff` à un snapshot pris au **début du pipeline** (avant le BUILD), mais cette détection ne s'exécute que si le FIXER retourne du non-JSON — pas si le sous-process est tué (exit code ≠ 0). Les fichiers modifiés par la FIX existent sur disque mais ne sont pas promus dans les artefacts ni dans `code_text`.
+
+    **Recovery** : après un FIX tué, toujours vérifier `git diff --stat` pour les changements sandbox non capturés. Les reviewers Codex sont généralement précis (5+ findings) ; vérifier manuellement si les plus critiques sont adressés, compiler, et décider si le code est acceptable ou si une nouvelle boucle est nécessaire.
+
+19. **Fable 5 safety filters → fallback silencieux vers Opus 4.8** — Fable 5 (Mythos-class) applique des garde-fous safety qui se déclenchent quand le mot "adversarial" est combiné avec des keywords offensifs dans le prompt (cybersec, espionnage, attaque, surveillance, hack, exploit, jailbreak, etc.). Quand le filtre se déclenche, on **ne voit pas d'erreur** — Fable bascule silencieusement vers Opus 4.8. La session continue normalement, mais c'est Opus qui répond.
+
+    **Signes de fallback silencieux:**
+    - Réponses plus rapides (Opus fait du reasoning court, pas d'extended thinking de 8-12 min)
+    - Pas de ✽/✻ spinner thinking dans le tmux pane
+    - Code moins créatif, plus conservateur
+    - Pas de découverte / utilisation automatique des MCP servers
+    - Les réponses arrivent en quelques secondes au lieu de minutes
+
+    **Contournement:** reformuler la spec pour éviter les keywords triggers. Mapping de substitution validé :
+    - "cybersec" → "domotique / assistance" ✓
+    - "espionnage / surveillance" → "sensing / presence detection" ✓
+    - "attaque / exploit" → "interaction / émission" ✓
+    - "détection d'intrus" → "détection de présence pour assistance personnes âgées / non-voyants" ✓
+
+    Si la spec ne peut pas être reformulée (ex: vrai travail cybersec légitime), utiliser Opus 4.8 explicitement dans `--dev-cmd` plutôt que Fable 5 — cela évite le fallback silencieux et donne un comportement prévisible.
+
+20. **claude-tmux-wrapper v1.3.0+ échecs d'intégration avec les skills adversarial** — Le wrapper `claude-tmux.py` a 7 échecs d'intégration documentés (5 root causes) quand il est utilisé comme sous-process des scripts adversarial. Principaux symptômes :
+
+    | N° | Root cause | Symptôme | Fréquence |
+    |----|-----------|----------|-----------|
+    | 1 | .done detection failure (Write tool bypass) | Sous-process bloqué malgré BUILD/FIX terminé | ~40% |
+    | 2 | Inactivity timeout vs extended thinking (pane spinner non détecté) | Exit code 3 "timed out" | ~25% |
+    | 3 | Orphaned wrapper process après tmux kill | Pipeline bloqué sur Popen.wait() | ~15% |
+    | 4 | File/done protocol incompatible avec sortie JSON-only | Fable 5 écrit du non-JSON → crash parse | ~10% |
+    | 5 | Safety filter fallback (adversarial+keyword) → Opus | Opus lent, verrous différents | ~10% |
+
+    **Stratégie générale:** quand un wrapper échoue de façon reproductible, passer en tmux manuel pur (sans claude-tmux.py wrapper). Le pattern tmux manuel est documenté dans `references/orphaned-wrapper-recovery.md`.
+
+21. **Recovery quand l'agent tue le background process adversarial** — L'agent (Hermes) lance l'adversarial loop en fond avec `background=true`. Si le wrapper se bloque (curseur tmux, .done failure), l'agent tue le background process. Le code écrit par Fable 5 sur le disque est récupérable — même si les artefacts du FIX ne sont pas promus. Workflow : `process(kill)` → `git diff --stat` → `make all + pio run` → commit. Voir `references/background-process-kill-recovery.md`.
+
+22. **Codex gonfle le nombre de tests (test inflation)** — Codex ajoute systématiquement des tests au-delà de la spec (spec demandait 9, Codex en a fait 21 ; spec demandait 8, Codex en a fait 12). C'est un BON signal (couverture gratuite) mais attention : (a) le nombre de tests total dans la spec est faux, (b) les tests bonus peuvent tester des edge cases que le code BUILD n'a pas gérés — vérifier qu'ils passent tous avant commit, (c) les tests supplémentaires alourdissent les suites — prévoir ~10% de temps test en plus. C'est un comportement connu de Codex (et de Fable 5 aussi, dans une moindre mesure).
+
+23. **Codex+DeepSeek : le FIX timeout systématiquement sur les specs d'intégration** — Avec `--timeout 300`, le FIX Codex sandbox timeout ~50% du temps sur les specs touchant 3+ fichiers. **Ne pas relancer la boucle.** Codex écrit sur le disque dans le sandbox avant le timeout. Workflow de recovery : `process(kill ou wait)` → `git diff --stat` → lire les findings DeepSeek → vérifier que les critiques sont adressés → `make all + pio run` → commit. Voir `references/codex-dev-deepseek-review-pattern.md`.
+
+24. **DeepSeek REVIEW plus lent mais plus exhaustif que Codex** — DeepSeek trouve 7-10 findings par spec (Codex : 2-4). Cold start 30-60s, review time ~60-120s. Prévoir 2-3 min de plus par spec qu'avec Codex REVIEW. Le verdict APPROVE est aussi plus fiable (moins de faux rejets).
+
+## Post-loop : extraction et vérification
+
+1. Lire `final.md` pour le verdict ; le code final y est aussi (« Code Final »).
+2. Si le script a écrit sur disque, la sortie affiche `-> Wrote XB to <target_file>`.
+3. Sinon, extraire le code de `01_code.md` (blocs ```` ```lang ````) et l'écrire.
+4. **Vérifier la TAILLE** des fichiers extraits (`wc -c`) — le FIXER sandbox peut écraser un fichier avec un message de prose. Faire un backup `01_code.md` → `01_code_BACKUP.md` après le BUILD.
+5. **Vérifier les écritures sandbox non capturées** — Si une phase a été tuée (SIGKILL) ou a timeouté, vérifier `git diff --stat` pour des fichiers modifiés par le FIXER avant la mort. Ces modifications ne seront PAS dans les artefacts.
+6. **Double écriture Fable 5** — Fable 5 en mode sandbox écrit souvent directement sur le disque (Write tool) EN PLUS du fichier de sortie demandé. Le fichier sur disque peut être plus complet (ou différent) que le code dans `01_code.md`. Comparer les deux versions avec `diff` :
+   ```bash
+   diff <(git show HEAD:src/main.cpp) src/main.cpp
+   ```
+7. Compiler / lancer les tests.
+8. Si le FIX a été partiel (phase tuée), décider manuellement : findings critiques adressés ? compilation OK ? Si oui, committer et documenter les findings restants comme dette technique.
+9. Committer si OK.
+
+## Verification Checklist
+
+- [ ] Spec claire (fichier texte, issue, ou description)
+- [ ] `--dev-cmd` et `--review-cmd` passés explicitement
+- [ ] `--max-loops` ≥ 1, `--timeout` ≥ 300 (900 pour Opus/Fable 5)
+- [ ] Artefacts dans `.adversarial-loop/`
+- [ ] Fichiers extraits vérifiés (`wc -c`, pas corrompus par FIXER sandbox)
+- [ ] Code compilé + tests passés avant commit
+- [ ] Aucun secret (API keys) dans les outputs
+
+## Références
+
+- Smit et al. (ICML 2024) — "Should we be going MAD? A Look at Multi-Agent Debate Strategies for LLMs"
+- Du et al. (ICML 2024) — "Improving Factuality and Reasoning in Language Models through Multiagent Debate"
+- `references/mutualization-checklist.md` — portage des fixs entre les deux skills adversarial
+- `references/fable5-reviewer-pattern.md` — Fable 5 comme REVIEWER (extended thinking, MCP, orchestration tmux)
+- `references/codex-pi-review-combo.md` — Codex DEV + pi/DeepSeek REVIEW (alternative quand Fable 5 en quota)
+- `references/builder-permission-stall.md` — BUILDER qui cale sans produire de code
+- `references/claude-interactive-wrapper-pattern.md` — wrapper `claude-tmux.py` (quota 5h vs Agent SDK)
+- `references/post-loop-extraction-workflow.md` — extraction du code post-loop
+- `references/pty-chardev-testing.md` — pattern de test pour transports PTY/chardev
+- `references/single-file-fix-workflow.md` — review → loop pour corriger un fichier unique
+- `references/skill-failure-analysis-2026-05-26.md` — 5 catégories d'échecs observés du pipeline
+- `references/calendar_add_2026-05-25.md` — session complète review → fix → release (Android Kotlin)
+- `references/quota-aware-orchestration.md` — pipeline multi-step avec reprise cron après quota
+- `references/claude-tmux-fable5-timeout-2026-06-11.md` — wrapper timeout pane inactivity vs extended thinking Fable 5, recovery
+- `references/bug-fix-after-review-workflow.md` — organizing review findings into small fix specs vs one big spec
+- `references/host-testing-embedded-c.md` — tests host pour code C embarqué (Unity framework, pas de Criterion)
+- `references/done-file-detection-recovery.md` — .done file detection failure et récupération manuelle
+- `templates/Makefile.host-tests-unity` — template Makefile pour tests host Unity

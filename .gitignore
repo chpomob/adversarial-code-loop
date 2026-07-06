@@ -1,0 +1,4 @@
+# Adversarial-loop artifacts (auto-appended per-repo too; kept here for the skill root).
+.adversarial-loop/
+# Integration test suite and its generated state stay out of the skill history.
+tests/
