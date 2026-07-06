@@ -39,6 +39,7 @@ from scripts.phases import (
     phase_build,
     phase_fix,
     phase_git,
+    phase_plan,
     phase_review,
     phase_verify,
 )
@@ -502,7 +503,6 @@ def build_parser():
     p = argparse.ArgumentParser(
         description="Adversarial Code Loop v4 "
                     "(BUILD -> REVIEW -> (FIX -> VERIFY)^N -> ARBITER, git-native)")
-    p.add_argument("--spec", required=True, help="Specification file to implement")
     p.add_argument("--workdir", default=".", help="Project directory (default: .)")
     p.add_argument("--dev-cmd", default=None,
                    help=f"BUILDER/FIXER command (default: $ACL_DEV_CMD or '{DEFAULT_DEV_CMD}')")
@@ -522,14 +522,20 @@ def build_parser():
                    help="Branch/artifact name (default: spec filename)")
     p.add_argument("--out", default=".adversarial-loop", help="Artifacts directory")
     p.add_argument("--resume", action="store_true", help="Resume from state.json")
+    # --spec and --plan are mutually exclusive (exactly one defines the work).
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--spec", help="Specification file to implement")
+    source.add_argument("--plan", help="plan.md to execute step by step")
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    if not os.path.isfile(args.spec):
-        print(f"X Spec not found: {args.spec}")
+    plan_mode = bool(args.plan)
+    source_file = args.plan or args.spec
+    if not source_file or not os.path.isfile(source_file):
+        print(f"X Source not found: {source_file!r}")
         return EXIT_USAGE
     workdir = str(Path(args.workdir).resolve())
     if not os.path.isdir(workdir):
@@ -547,7 +553,7 @@ def main(argv=None):
     # The arbiter is optional: no flag and no env var means "no arbiter".
     arbiter_cmd = (args.arbiter_cmd or os.environ.get("ACL_ARBITER_CMD") or "").strip()
 
-    feature = gitops.sanitize_feature_name(args.feature or Path(args.spec).stem)
+    feature = gitops.sanitize_feature_name(args.feature or Path(source_file).stem)
     if not feature:
         print("X Could not derive a feature name; pass --feature")
         return EXIT_USAGE
@@ -559,21 +565,27 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     state = {}
-    if args.resume:
+    if args.resume and not plan_mode:
         saved = _read_json(out_dir / "state.json")
         if saved and saved.get("branch"):
             state = saved
         else:
             print("! No resumable state.json found — starting fresh")
 
-    print(f"\n{'#' * 60}\n  ADVERSARIAL CODE LOOP v4\n"
-          f"  Spec: {args.spec}\n  Feature: {feature}\n"
-          f"  Max loops: {args.max_loops}\n"
-          f"  DEV: {dev_cmd[:60]}\n  REVIEW: {review_cmd[:60]}\n{'#' * 60}")
+    if not plan_mode:
+        print(f"\n{'#' * 60}\n  ADVERSARIAL CODE LOOP v4\n  Spec: {args.spec}\n"
+              f"  Feature: {feature}\n  Max loops: {args.max_loops}\n"
+              f"  DEV: {dev_cmd[:60]}\n  REVIEW: {review_cmd[:60]}\n{'#' * 60}")
 
     try:
-        code = _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
-                         workdir, feature, out_dir, state)
+        if plan_mode:
+            code = phase_plan.run_plan(
+                args.plan, args, workdir, feature, out_dir, state,
+                dev_cmd, review_cmd, arbiter_cmd,
+                run_pipeline=_pipeline, final_md=_final_md)
+        else:
+            code = _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
+                             workdir, feature, out_dir, state)
     except KeyboardInterrupt:
         print("\nX Interrupted — restoring workdir "
               "(loop branch kept; rerun with --resume to continue)")
