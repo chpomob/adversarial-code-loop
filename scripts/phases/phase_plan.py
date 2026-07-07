@@ -31,6 +31,9 @@ _PASSED = (EXIT_APPROVED, EXIT_ARBITRATED)
 # so the lazy quantifier was a no-op. group(1) is .strip()'d downstream anyway.
 _BULLET_RE = re.compile(r"^-\s+\*\*([^*]+)\s*:\*\*\s*(.*)$")
 _HEADING_RE = re.compile(r"^###\s+(\S+?)\s*:\s*(.*)$")
+# A bullet that is NOT a `- **Key:** value` line — the shape of a multi-line
+# sub-list, which parse_plan cannot read (SKILL.md pitfall #26).
+_SUBLIST_RE = re.compile(r"^\s*-\s+\S")
 
 
 # --- parsing -----------------------------------------------------------------
@@ -93,12 +96,18 @@ def parse_plan(plan_path):
     Each step: ``{id, title, files[], description, dependencies[], tests, risks}``.
     Frontmatter is parsed but currently unused (feature name comes from
     ``--feature`` / the plan filename); kept tolerant so future fields land.
+
+    Raises ValueError when ``Files:``/``Dependencies:`` are followed by a
+    multi-line bullet list instead of a single comma-separated line
+    (SKILL.md pitfall #26) — silently dropping the values would run steps
+    against the wrong files.
     """
     text = Path(plan_path).read_text(encoding="utf-8")
     _fm, body = _split_frontmatter(text)
 
     steps = []
     current = None
+    pending_list_key = None  # files/dependencies bullet left without a value
     for line in body.splitlines():
         heading = _HEADING_RE.match(line)
         if heading:
@@ -113,14 +122,24 @@ def parse_plan(plan_path):
                 "tests": "",
                 "risks": "",
             }
+            pending_list_key = None
             continue
         if current is None:
             continue
         m = _BULLET_RE.match(line)
         if not m:
+            if pending_list_key and _SUBLIST_RE.match(line):
+                raise ValueError(
+                    f"step {current['id']}: '{pending_list_key.capitalize()}:' is "
+                    "followed by a multi-line bullet list, which parse_plan cannot "
+                    "read. Put all values on one comma-separated line, e.g. "
+                    "'- **Files:** /path/one, /path/two' (SKILL.md pitfall #26)")
             continue
         key = m.group(1).strip().lower()
         val = m.group(2).strip()
+        # An explicit `[]` is an intentional empty list; a bare key with no
+        # value usually means the values follow as sub-bullets — flag those.
+        pending_list_key = key if key in ("files", "dependencies") and not val else None
         if key in ("files", "dependencies"):
             current[key] = _parse_list(val)
         elif key in current:
@@ -311,7 +330,7 @@ def run_plan(plan_path, args, workdir, feature, out_dir, state,
     except (OSError, UnicodeDecodeError) as exc:
         print(f"X could not read plan {plan_path}: {exc}")
         return EXIT_USAGE
-    except ValueError as exc:  # malformed frontmatter from _split_frontmatter
+    except ValueError as exc:  # malformed frontmatter or multi-line bullet list
         print(f"X invalid plan {plan_path}: {exc}")
         return EXIT_USAGE
     try:

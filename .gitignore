@@ -1,3 +1,6 @@
+# Python bytecode is platform/version-specific and unmergeable — never version it.
+__pycache__/
+*.py[cod]
 # Adversarial-loop artifacts (auto-appended per-repo too; kept here for the skill root).
 .adversarial-loop/
 # Integration test suite and its generated state stay out of the skill history.

@@ -293,8 +293,9 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
 3. **GLM JSON wrapped in markdown — parsed in v4, not v3.** v3 used strict `json.loads`
    and choked on `` ```json ``-fenced output. v4's `jsonio.strip_json_wrapper` strips
    fences and extracts the largest JSON object, so GLM-5.2 / Claude markdown-wrapped JSON
-   is now parsed. The VERIFY phase uses an even more robust 3-strategy parser
-   (`_try_parse_json`) that tries: (1) markdown stripping, (2) extracting `{...}` via
+   is now parsed. Since P6, every phase (including VERIFY) routes through the shared
+   3-strategy parser `adversarial_common.jsonio.parse_json_output`, which tries:
+   (1) markdown stripping, (2) extracting `{...}` via
    `text.find('{')`..`rfind('}')`, (3) extracting `[...]` for raw arrays. This makes the
    pipeline **model-agnostic** — the same code works regardless of whether the model
    returns raw JSON, markdown-wrapped JSON, text + JSON, or a JSON array. REVIEW/VERIFY
@@ -415,6 +416,24 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
     the loop branch checkout.** The review prompt is under 1K tokens. The reviewer
     runs `git diff HEAD~1..HEAD` to see changes and reads files with `cat`/`grep`
     for context. See `references/review-on-committed-code.md`.
+25. **Multi-repo plan mode is experimental.** `_resolve_step_workdir()` detects the
+    correct repo for each step's files. Only the BUILD phase runs in the resolved repo;
+    plan git lifecycle stays in `--workdir`. If the step's files are already done,
+    squash-merge may fail with "nothing to commit" — mitigated by `squash_merge()`
+    falling back to `git merge --ff-only`.
+26. **`--plan` file list format: one line, comma-separated.** Multi-line bullet lists
+    under `Files:` and `Dependencies:` are NOT parsed by `parse_plan()`. Bad:
+    `- **Files:**\n  - /path/one`. Good: `- **Files:** /path/one, /path/two`.
+    `parse_plan()` now rejects the bad shape with an explicit ValueError
+    (surfaced as `X invalid plan ...`, exit 2) instead of silently dropping files.
+27. **`gitops.create_branch()` required for --plan mode.** `phase_plan.execute_step()`
+    calls `gitops.create_branch()` (not `create_loop_branch`). Add if missing.
+28. **GLM-5.2 quota is 80 prompts per rolling 5h (Z.AI Lite).** HTTP 429 after 2-3
+    heavy loops. Recovery: switch to DeepSeek or Claude, or wait 5h.
+29. **User preference — monitor actively or stay silent.** Use polling loops or
+    `notify_on_complete=true`. Never promise to "check back" without following through.
+30. **User preference — quality over speed.** Always use `--thinking high`. Set generous
+    timeouts (`--timeout 2400`). Accept 10-15 min BUILD times.
 
 v3 is preserved verbatim as `scripts/adversarial_loop_v3.py` for one release. To migrate:
 
@@ -485,6 +504,31 @@ To manually add a note about a limitation you noticed, add an entry at the top o
 - **Fix/workaround:** How you worked around it
 - **Would fix in v5 by:** Concrete design change
 ```
+
+## --plan mode (multi-step plans)
+
+v4 supports executing a pre-written plan via `--plan plan.md`. Each step runs as a
+full adversarial loop on its own sub-branch `loop/<feature>/<step_id>/<N>`.
+
+Plan format (output of `adversarial-plan`):
+
+```
+### P1: Step title
+- **Files:** /path/to/file1, /path/to/file2
+- **Description:** What to implement
+- **Dependencies:** []
+- **Tests:** How to verify
+- **Risks:** What could go wrong
+```
+
+**Format rules:** Files MUST be on a single line (comma-separated), NOT multi-line
+bullet lists (`phase_plan.parse_plan` reads bullet keys by line only).
+Dependencies MUST reference existing step IDs.
+
+**Multi-repo support:** Each step's files are inspected by
+`_resolve_step_workdir()` which detects the enclosing git repo. If all files belong
+to the same repo, the step runs there. This allows cross-skill refactoring.
+Experimental — see pitfall #25.
 
 ## Changelog
 

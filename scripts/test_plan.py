@@ -108,11 +108,40 @@ def test_step_spec_text_carries_fields():
         assert needle in txt, (needle, txt)
 
 
+def test_parse_plan_rejects_multiline_bullet_lists():
+    bad = """\
+### P1: Step
+- **Files:**
+  - /path/one
+  - /path/two
+- **Description:** D
+- **Dependencies:** []
+"""
+    try:
+        P.parse_plan(_write_plan(bad))
+    except ValueError as exc:
+        assert "multi-line bullet list" in str(exc), exc
+        assert "P1" in str(exc), exc
+    else:
+        raise AssertionError("multi-line Files: list should raise ValueError")
+    # Explicit `[]` stays an intentional empty list, even with prose bullets after.
+    ok = """\
+### P1: Step
+- **Files:** /path/one
+- **Description:** D
+- **Dependencies:** []
+- **Risks:** none
+"""
+    steps = P.parse_plan(_write_plan(ok))
+    assert steps[0]["files"] == ["/path/one"], steps
+
+
 def main():
     test_parse_plan()
     test_validate_steps_ok_and_errors()
     test_topo_sort_orders_dependencies_first()
     test_step_spec_text_carries_fields()
+    test_parse_plan_rejects_multiline_bullet_lists()
     print("OK: plan parse / validate / topo-sort self-checks pass")
 
 
