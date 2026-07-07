@@ -7,7 +7,7 @@ access to findings on disk. They can read files directly and run
 
 ``run_verify(findings, diff_text, review_cmd, providers, jsonio) -> dict``
 """
-import json, re
+import json
 from typing import Any
 
 __all__ = ["run_verify"]
@@ -30,42 +30,6 @@ def _validate(payload: Any) -> bool:
         if item.get("status") not in _VALID_STATUS:
             return False
     return True
-
-
-def _try_parse_json(text: str) -> dict | None:
-    """Parse JSON from model output, trying multiple extraction strategies.
-    
-    1. strip_json_wrapper (removes ```json...``` markdown)
-    2. Find first { and last } in the text
-    3. Find first [ and last ] for JSON arrays
-    """
-    import ast  # safe literal eval as last resort
-    text = text.strip()
-    
-    # Strategy 1: markdown wrapper
-    if text.startswith("```"):
-        lines = text.splitlines()
-        cleaned = []
-        for line in lines:
-            if line.strip().startswith("```"):
-                continue
-            cleaned.append(line)
-        text = "\n".join(cleaned).strip()
-    
-    # Strategy 2: find JSON object
-    for strategy_name, parse_fn in [
-        ("json.loads", lambda t: json.loads(t)),
-        ("extract { }", lambda t: json.loads(t[t.find("{"):t.rfind("}")+1]) if "{" in t else None),
-        ("extract [ ]", lambda t: json.loads(t[t.find("["):t.rfind("]")+1]) if "[" in t else None),
-    ]:
-        try:
-            result = parse_fn(text)
-            if result is not None:
-                return result
-        except (json.JSONDecodeError, ValueError, IndexError):
-            continue
-    
-    return None
 
 
 def run_verify(
@@ -114,7 +78,7 @@ def run_verify(
         )
         if code != 0:
             return None, f"VERIFY exited {code}: {(stderr or '')[:200]}", stdout
-        payload = _try_parse_json(stdout)
+        payload = jsonio.parse_json_output(stdout)
         return payload, None, stdout
 
     try:

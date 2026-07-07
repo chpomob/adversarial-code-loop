@@ -101,3 +101,11 @@ Add a new entry at the top:
 - **Symptom:** Claude/Fable 5 (extended thinking 15-20 min) tué par le timeout alors qu'il produit. Codex bloqué sur quota non détecté.
 - **Root cause:** Le timeout est un mur absolu. Aucune distinction entre "réfléchit" et "bloqué".
 - **Would fix in v5 by:** Pas de timeout. Boucle de monitoring : si le process est vivant ET produit (stdout, fichiers, tmux), on attend. Si mort ou quota detecté dans le stdout/stderr, on arrête. Infini patience pour la réflexion, réaction instantanée pour les échecs.
+
+### 2026-07-07 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/refacto-v6/P6/1
+- **Error:** DEV exited 1: 429 Usage limit reached for 5 hour. Your limit will reset at 2026-07-07 20:57:21
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
