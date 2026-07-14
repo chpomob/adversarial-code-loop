@@ -431,6 +431,29 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
     plan git lifecycle stays in `--workdir`. If the step's files are already done,
     squash-merge may fail with "nothing to commit" — mitigated by `squash_merge()`
     falling back to `git merge --ff-only`.
+
+25b. **Multi-repo --plan mode auto-initializes parent repo when `--workdir` has no `.git`.** 
+    If `--workdir` is a parent directory containing multiple sibling git repos (e.g.
+    `~/.hermes/skills` containing adversarial-common/, adversarial-code-loop/, etc.),
+    the `--plan` pipeline's PHASE 0 calls `gitops.auto_init(workdir)` which creates a
+    *parent* git repo. All BUILD commits then go into this parent repo as git submodule
+    references, NOT into the individual skill repos. The steps report `"passed"` with
+    `"0 loops"` (empty-diff approval) but the actual Python file changes are **not**
+    committed to the skill repositories.
+    **Symptom:** plan output shows `passed (0 loops)` for every step, but `git log` in
+    each skill repo shows no new commits. The parent `--workdir` directory has a `.git`
+    you didn't create, and `git status` shows the skill subdirectories as dirty submodule
+    references.
+    **Fix:** 
+    1. Remove the auto-initialized parent repo: `rm -rf <workdir>/.git`
+    2. In each skill repo, `git add -A && git commit -m "fix: ..."` to capture the changes
+       that Codex wrote to disk but that the parent repo swallowed.
+    3. Do NOT rely on `--plan` mode for multi-repo plans — use single-repo plans or run
+       each step manually.
+    **Validated 2026-07-14** on an 18-step cross-skill plan: steps A1–A14 all passed with
+    0 loops but the code changes (embedded in the skill subdirectories) were not tracked
+    in any skill repo. Only a `rm -rf .git` + manual `git add -A` per skill recovered the
+    work.
 26. **claude-tmux `--cwd` is REQUIRED when `--workdir` differs from the script's CWD (plan mode).** The adversarial loop script runs from `adversarial-code-loop/scripts/`, but reviews inspect the `--workdir` tree. claude-tmux spawns a tmux session whose CWD defaults to the *subprocess* CWD — which is the loop script's directory, NOT `--workdir`. Without `--cwd`, the reviewer runs `git diff` in the wrong repo and reports an empty diff even though the BUILD commit exists on the correct branch in `--workdir`. **Symptom:** REVIEW exits with 0 but findings say "the commit under review is empty" or "the worktree is checked out on `main`" — check whether claude-tmux has `--cwd`. **Fix:** always pass `--cwd <workdir>` to claude-tmux in the `--review-cmd` (and `--dev-cmd` if claude-tmux is the DEV). The claude-tmux `--cwd` flag translates to tmux's `-c` / `default-command` flag, setting the shell's working directory inside the session. Example:
    ```bash
    --review-cmd "python3 /path/to/claude-tmux.py --yolo --model best --timeout 900 --hard-timeout 2400 --cwd /home/user/plugins/hermes-quota-status"
@@ -576,6 +599,8 @@ a stdin concatenation.
 - `references/claude-p-migration-pattern.md`, `references/wrapper-failures.md` — Claude wrapper notes
 - `references/full-pipeline-validated.md` — end-to-end validation of brief→spec→plan→code (10-step --plan mode, Codex DEV + Claude/DeepSeek REVIEW, 2026-07-08)
 - `references/partial-merge-gap-fill.md` — gap-matrix workflow when the upstream already has a partial implementation of your targeted feature (gap analysis → gap-focused spec → plan → code loop)
+- `references/github-secret-scanning-bypass.md` — bypass GitHub push protection for public OAuth credentials
+- `references/delegate-task-review-timeout.md` — why delegate_task CANNOT run long adversarial reviews
 - Smit et al. (ICML 2024) "Should we be going MAD?"; Du et al. (ICML 2024)
 
 ## Resuming a failed --plan pipeline
@@ -670,7 +695,9 @@ Dependencies MUST reference existing step IDs.
 **Multi-repo support:** Each step's files are inspected by
 `_resolve_step_workdir()` which detects the enclosing git repo. If all files belong
 to the same repo, the step runs there. This allows cross-skill refactoring.
-Experimental — see pitfall #25.
+**Experimental** — see pitfalls #25 and #25b. The primary risk: if `--workdir` has no
+`.git` of its own, the pipeline auto-initializes one and commits submodule references
+instead of actual code changes. Prefer single-repo plans where possible.
 
 ## Changelog
 
