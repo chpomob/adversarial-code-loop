@@ -5,3 +5,7 @@ __pycache__/
 .adversarial-loop/
 # Integration test suite and its generated state stay out of the skill history.
 tests/
+
+.venv/
+.pytest_cache/
+*.py[cod]

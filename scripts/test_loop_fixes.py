@@ -10,6 +10,8 @@ import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SKILL_ROOT = os.path.dirname(_HERE)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 if _SKILL_ROOT not in sys.path:
     sys.path.insert(0, _SKILL_ROOT)
 _COMMON = os.path.abspath(os.path.join(_SKILL_ROOT, os.pardir, "adversarial-common"))
@@ -17,8 +19,11 @@ if os.path.isdir(_COMMON) and _COMMON not in sys.path:
     sys.path.insert(0, _COMMON)
 
 import argparse  # noqa: E402
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
 from adversarial_common import gitops  # noqa: E402
+import adversarial_loop as loop  # noqa: E402
 from adversarial_loop import _ensure_ids, _unresolved, _positive_int  # noqa: E402
 
 
@@ -86,6 +91,34 @@ def test_f6_identity_bootstrapped_when_unset():
                 os.environ[k] = v
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_merge_failure_returns_infra_and_records_error(tmp_path, monkeypatch):
+    """A logical approval must not hide an unsuccessful squash merge."""
+    monkeypatch.setattr(
+        loop.phase_git,
+        "finalize_git",
+        lambda *_args, **_kwargs: {
+            "exit_code": 1,
+            "merged": False,
+            "error": "squash merge loop/demo/1 -> main failed: conflict",
+        },
+    )
+    state = {
+        "parent_branch": "main",
+        "branch": "loop/demo/1",
+        "completed": [],
+    }
+
+    code = loop._finish(
+        SimpleNamespace(no_merge=False), str(tmp_path), "demo", tmp_path,
+        state, "APPROVED",
+    )
+
+    assert code == loop.EXIT_INFRA
+    final = json.loads((tmp_path / "final.json").read_text())
+    assert final["merged"] is False
+    assert "squash merge" in final["error"]
 
 
 def main():

@@ -2,8 +2,8 @@
 REVIEW phase: run REVIEW model with project access to the loop branch.
 
 The reviewer checks the code on disk (checked out at loop branch HEAD).
-They can read files directly and run ``git diff HEAD~1..HEAD`` to see
-what changed. Output is validated JSON findings.
+They can read files directly and run ``git diff <branch-point>..HEAD`` to see
+the cumulative change. Output is validated JSON findings.
 
 ``run_review(diff_text, review_cmd, providers, jsonio, workdir) -> dict``
 """
@@ -39,12 +39,12 @@ def _validate(payload: Any) -> bool:
     return True
 
 
-def _build_prompt(diff_text: str, workdir: str) -> str:
+def _build_prompt(diff_text: str, workdir: str, branch_point: str = "") -> str:
     """Build a prompt that tells the reviewer to explore the code on disk.
 
     The reviewer is in `workdir` (checked out at loop branch HEAD). They can:
     - Read any file from disk
-    - Run ``git diff HEAD~1..HEAD`` or ``git log -1 -p`` to see the last change
+    - Run ``git diff <branch-point>..HEAD`` to see the cumulative change
     """
     import subprocess
     try:
@@ -55,17 +55,18 @@ def _build_prompt(diff_text: str, workdir: str) -> str:
     except Exception:
         branch = "(unknown)"
 
+    diff_base = branch_point or "<branch-point>"
     return (
         f"You are reviewing code in a git branch. The working directory is "
         f"checked out at `{branch}` (the latest commit to review).\n\n"
-        f"To see what changed in the last commit, run:\n"
-        f"  git diff HEAD~1..HEAD   — line-by-line diff\n"
-        f"  git log -1 -p            — full diff with commit message\n\n"
+        f"The branch-point SHA for this review is `{diff_base}`.\n"
+        f"To see the cumulative change since that branch point, run:\n"
+        f"  git diff {diff_base}..HEAD   — line-by-line diff\n\n"
         f"To see the full context of a file, read it from disk or use:\n"
         f"  cat <filepath>\n\n"
-        f"Review the LAST commit's changes. Each finding must reference a real "
-        f"file and line visible in the latest commit's diff. Do NOT report "
-        f"pre-existing issues outside this commit.\n\n"
+        f"Review the cumulative changes since `{diff_base}`. Each finding must "
+        f"reference a real file and line visible in that diff. Do NOT report "
+        f"pre-existing issues outside this branch's change.\n\n"
         f"Output ONLY valid JSON:\n"
         f'{{"findings": [{{"id": "A1", "severity": "blocker|major|minor|nit", '
         f'"file": "path", "line": 42, "summary": "...", '
@@ -80,22 +81,25 @@ def run_review(
     providers: Any,
     jsonio: Any,
     workdir: str = "",
+    timeout: int = 600,
+    branch_point: str = "",
 ) -> dict:
     """
     Run REVIEW model with project access to the loop branch.
 
     The reviewer reads files directly from disk and runs git diff to see
-    what changed in the last commit. Output JSON is validated against the
+    what changed since the branch point. Output JSON is validated against the
     v4 schema. Retries once on invalid JSON.
 
     Returns ``{"phase": "review", "findings": [...], "verdict": "...",
                "exit_code": 0}``.
     """
-    prompt = _build_prompt(diff_text, workdir)
+    prompt = _build_prompt(diff_text, workdir, branch_point)
 
     def _attempt(prompt_text):
         stdout, stderr, code = providers.run_cmd(
             review_cmd, stdin_text=prompt_text, role="critic",
+            timeout=timeout, cwd=workdir,
         )
         if code != 0:
             return None, f"REVIEW exited {code}: {(stderr or '')[:200]}", stdout

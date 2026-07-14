@@ -360,7 +360,9 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             return _finish(args, workdir, feature, out_dir, state,
                            "REJECT", reason="EMPTY_DIFF")
         _banner("REVIEW  (CRITIC)")
-        review = phase_review.run_review(diff, review_cmd, providers, jsonio)
+        review = phase_review.run_review(
+            diff, review_cmd, providers, jsonio, workdir=workdir,
+            branch_point=branch_point)
         _write_json(out_dir, "02_review.json", review)
         if review["exit_code"] != 0:
             return _phase_failed("review", review, state, out_dir)
@@ -397,7 +399,8 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             _banner(f"VERIFY  (round {n}/{args.max_loops})")
             diff = gitops.get_diff(workdir, branch_point)
             verify = phase_verify.run_verify(
-                findings, diff, review_cmd, providers, jsonio)
+                findings, diff, review_cmd, providers, jsonio,
+                workdir=workdir, branch_point=branch_point)
             _write_json(out_dir, f"04_verdict_{n}.json", verify)
             if verify["exit_code"] != 0:
                 return _phase_failed(f"verify_{n}", verify, state, out_dir)

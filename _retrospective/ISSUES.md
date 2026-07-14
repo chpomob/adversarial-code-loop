@@ -109,3 +109,89 @@ Add a new entry at the top:
 - **Error:** DEV exited 1: 429 Usage limit reached for 5 hour. Your limit will reset at 2026-07-07 20:57:21
 - **Stdout (last 200 chars):** ''
 - **Auto-logged by pipeline**
+
+### 2026-07-07 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/acl-spec-evbj/1
+- **Error:** DEV exited 124: TIMEOUT after 1s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-10 — review failed for unknown
+
+- **Phase:** review
+- **Branch:** loop/omnisense-fixes/P6/1
+- **Error:** REVIEW exited 124: TIMEOUT after 600s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-11 — verify_1 failed for unknown
+
+- **Phase:** verify_1
+- **Branch:** loop/omnisense-radar/P6/1
+- **Error:** VERIFY exited 124: TIMEOUT after 600s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-11 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/omnisense-radar/P9/1
+- **Error:** DEV exited 1: Reading prompt from stdin...
+OpenAI Codex v0.144.1
+--------
+workdir: /media/chpo/HDD-papa/CardPuter-ADV/omnisense/firmware
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-acce
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-13 — review failed for unknown
+
+- **Phase:** review
+- **Branch:** loop/quota-status-publish-fixes/P1/1
+- **Error:** REVIEW exited 124: TIMEOUT after 600s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-14 — review failed for unknown
+
+- **Phase:** review
+- **Branch:** loop/quota-status-publish-fixes/P8/1
+- **Error:** REVIEW exited 124: TIMEOUT after 600s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-14 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/acl-spec-okxu/1
+- **Error:** DEV exited 124: TIMEOUT after 1s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-14 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/acl-spec-dtgz/1
+- **Error:** DEV exited 124: TIMEOUT after 1s
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**
+
+### 2026-07-14 — build failed for unknown
+
+- **Phase:** build
+- **Branch:** loop/adversarial-skills-fixes/A15/1
+- **Error:** DEV exited 1: Reading prompt from stdin...
+OpenAI Codex v0.144.1
+--------
+workdir: /home/chpo/.hermes/skills
+model: gpt-5.6-sol
+provider: openai
+approval: on-request
+sandbox: workspace-write [workdir, /tmp, $TMPDIR
+- **Stdout (last 200 chars):** ''
+- **Auto-logged by pipeline**

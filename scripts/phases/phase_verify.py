@@ -3,9 +3,10 @@ VERIFY phase: check if findings are resolved.
 
 The verifier is placed in the workdir (checked out at loop branch HEAD) with
 access to findings on disk. They can read files directly and run
-``git diff HEAD~1..HEAD`` to see what changed. Output is validated JSON.
+``git diff <branch-point>..HEAD`` to see the cumulative change. Output is
+validated JSON.
 
-``run_verify(findings, diff_text, review_cmd, providers, jsonio) -> dict``
+``run_verify(findings, diff_text, review_cmd, providers, jsonio, timeout, workdir) -> dict``
 """
 import json
 from typing import Any
@@ -38,12 +39,15 @@ def run_verify(
     review_cmd: str,
     providers: Any,
     jsonio: Any,
+    timeout: int = 600,
+    workdir: str = "",
+    branch_point: str = "",
 ) -> dict:
     """
     Run VERIFY model with project access to the loop branch.
 
     The verifier reads findings from review JSON, explores the code on disk,
-    runs ``git diff HEAD~1..HEAD`` to see changes, and outputs per-finding
+    runs ``git diff <branch-point>..HEAD`` to see changes, and outputs per-finding
     status. JSON extraction tries multiple strategies to be model-agnostic.
 
     Returns ``{"phase": "verify", "results": [...], "verdict": "...",
@@ -53,18 +57,19 @@ def run_verify(
     try:
         branch = subprocess.run(
             ["git", "symbolic-ref", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, cwd=workdir, timeout=5,
         ).stdout.strip()
     except Exception:
         branch = "(unknown)"
 
+    diff_base = branch_point or "<branch-point>"
     prompt = (
         f"You are verifying code in a git branch checked out at `{branch}`.\n\n"
         "For each finding below, determine whether it is **resolved** (code fixed), "
         "**rejected** (finding was wrong), or **disputed** (unclear).\n\n"
-        "To see what changed:\n"
-        "  git diff HEAD~1..HEAD\n"
-        "  git log -1 -p\n\n"
+        f"The branch-point SHA for this review is `{diff_base}`.\n"
+        "To see the cumulative change since that branch point:\n"
+        f"  git diff {diff_base}..HEAD\n\n"
         "To see full files: cat <filepath>\n\n"
         f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
         "Output ONLY valid JSON:\n"
@@ -75,6 +80,7 @@ def run_verify(
     def _attempt(prompt_text):
         stdout, stderr, code = providers.run_cmd(
             review_cmd, stdin_text=prompt_text, role="verifier",
+            timeout=timeout, cwd=workdir,
         )
         if code != 0:
             return None, f"VERIFY exited {code}: {(stderr or '')[:200]}", stdout

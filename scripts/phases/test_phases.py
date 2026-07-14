@@ -38,10 +38,12 @@ class StubProviders:
     def __init__(self, workdir):
         self.workdir = workdir
         self.roles = []
+        self.prompts = []
 
     def run_cmd(self, cmd, stdin_text=None, timeout=600, cwd=None, role=None,
                 project=None):
         self.roles.append(role)
+        self.prompts.append({"role": role, "text": stdin_text or ""})
         if role == "builder":
             with open(os.path.join(self.workdir, "app.txt"), "w") as fh:
                 fh.write("v1\n")
@@ -94,10 +96,16 @@ def _run_full_flow():
         diff = gitops.get_diff(tmp, setup["branch_point"])
         assert "app.txt" in diff
 
-        review = run_review(diff, "fake-review", providers, jsonio)
+        review = run_review(
+            diff, "fake-review", providers, jsonio,
+            branch_point=setup["branch_point"])
         assert review["exit_code"] == 0, review
         assert review["verdict"] == "REQUEST_CHANGES"
         assert review["findings"][0]["id"] == "A1"
+        review_prompt = next(
+            p["text"] for p in providers.prompts if p["role"] == "critic")
+        assert setup["branch_point"] in review_prompt
+        assert "HEAD~1" not in review_prompt
 
         fix = run_fix(review["findings"], "fake-dev", tmp, 60, "demo-feature",
                       1, providers)
@@ -105,11 +113,16 @@ def _run_full_flow():
         assert fix["loop"] == 1 and fix["commit_sha"]
 
         diff2 = gitops.get_diff(tmp, setup["branch_point"])
-        verify = run_verify(review["findings"], diff2, "fake-review",
-                            providers, jsonio)
+        verify = run_verify(
+            review["findings"], diff2, "fake-review", providers, jsonio,
+            branch_point=setup["branch_point"])
         assert verify["exit_code"] == 0, verify
         assert verify["verdict"] == "APPROVE"
         assert verify["results"][0]["status"] == "resolved"
+        verify_prompt = next(
+            p["text"] for p in providers.prompts if p["role"] == "verifier")
+        assert setup["branch_point"] in verify_prompt
+        assert "HEAD~1" not in verify_prompt
 
         # evidence artifact for the tag
         evidence = os.path.join(tmp, "final.json")

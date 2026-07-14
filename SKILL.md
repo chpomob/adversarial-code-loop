@@ -247,8 +247,8 @@ python3 ~/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
 # so push --timeout up and keep the inner --hard-timeout >= the loop timeout.
 python3 ~/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
   --spec /tmp/spec.md --workdir /path/to/project \
-  --dev-cmd "python3 /home/chpo/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py --yolo --model best --timeout 600 --hard-timeout 1200 --max-turns 20" \
-  --timeout 1800
+  --dev-cmd "python3 /home/chpo/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py --yolo --model best --timeout 900 --hard-timeout 2400 --max-turns 20" \
+  --timeout 2400
 
 # GLM-5.2 DEV + DeepSeek REVIEW (thinking high on both). No Claude quota needed.
 python3 ~/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
@@ -301,9 +301,19 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
    returns raw JSON, markdown-wrapped JSON, text + JSON, or a JSON array. REVIEW/VERIFY
    still retry once on malformed JSON. If a model returns prose with no JSON object at
    all, the phase fails (exit 1) — check the captured stdout in the artifact.
-4. **Claude extended thinking runs 8-12 min (Fable 5).** Pass `--timeout 600
-   --hard-timeout 900` *inside* the claude-tmux command and keep the loop's `--timeout`
-   `>= 900`. If a phase hangs or exits 3, see `references/wrapper-failures.md` and the
+4. **Claude extended thinking runs 8-12 min (Fable 5).** Pass
+   `--timeout 900 --hard-timeout 2400` *inside* the claude-tmux command and keep the
+   loop's `--timeout >= 2400`. The inner `--timeout` controls tmux pane inactivity
+   detection — if Claude goes silent for more than this period, the pane is killed.
+   With extended thinking, Claude can be silent for 12+ minutes even on small codebases
+   (validated 2026-07-13 on a ~2580-line plugin: first review timed out at 600s).
+   **Never use `--timeout 600` or lower** for Fable 5 REVIEW — the first pass always
+   has the longest thinking burst as it reads the full diff and project structure. Set
+   `--hard-timeout 2400` (40 min) to survive Verifier passes that require multiple file
+   reads. If Claude repeatedly times out, switch `--review-cmd` to GLM-5.2
+   (`pi -p --provider zai --model glm-5.2 --thinking high`), which is faster (no
+   extended thinking) and equally reliable for JSON output. See
+   `references/wrapper-failures.md`, `references/fable5-timeout-recovery.md`, and the
    `claude-tmux-wrapper` skill.
 5. **Dirty working tree must be committed or stashed.** v4 auto-stashes at PHASE 0 and
    restores on every exit path, so a dirty tree no longer blocks startup. The remaining
@@ -421,19 +431,107 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
     plan git lifecycle stays in `--workdir`. If the step's files are already done,
     squash-merge may fail with "nothing to commit" — mitigated by `squash_merge()`
     falling back to `git merge --ff-only`.
-26. **`--plan` file list format: one line, comma-separated.** Multi-line bullet lists
+26. **claude-tmux `--cwd` is REQUIRED when `--workdir` differs from the script's CWD (plan mode).** The adversarial loop script runs from `adversarial-code-loop/scripts/`, but reviews inspect the `--workdir` tree. claude-tmux spawns a tmux session whose CWD defaults to the *subprocess* CWD — which is the loop script's directory, NOT `--workdir`. Without `--cwd`, the reviewer runs `git diff` in the wrong repo and reports an empty diff even though the BUILD commit exists on the correct branch in `--workdir`. **Symptom:** REVIEW exits with 0 but findings say "the commit under review is empty" or "the worktree is checked out on `main`" — check whether claude-tmux has `--cwd`. **Fix:** always pass `--cwd <workdir>` to claude-tmux in the `--review-cmd` (and `--dev-cmd` if claude-tmux is the DEV). The claude-tmux `--cwd` flag translates to tmux's `-c` / `default-command` flag, setting the shell's working directory inside the session. Example:
+   ```bash
+   --review-cmd "python3 /path/to/claude-tmux.py --yolo --model best --timeout 900 --hard-timeout 2400 --cwd /home/user/plugins/hermes-quota-status"
+   ```
+   The `claude-tmux-wrapper` skill documents `--cwd` in its flag table but the adversarial loop pitfall #26 is the right place to warn callers. Without this, the first plan step always fails with an empty-diff finding and wastes a full loop round before you debug it.
+
+27. **`--plan` file list format: one line, comma-separated.** Multi-line bullet lists
     under `Files:` and `Dependencies:` are NOT parsed by `parse_plan()`. Bad:
-    `- **Files:**\n  - /path/one`. Good: `- **Files:** /path/one, /path/two`.
+    `- **Files:**\\\\n  - /path/one`. parse_plan() accepts both comma-separated lists (`/path/a, /path/b`) and bracket lists (`[/path/a, /path/b]`). The adversarial-plan tool outputs bracket-list format.
     `parse_plan()` now rejects the bad shape with an explicit ValueError
     (surfaced as `X invalid plan ...`, exit 2) instead of silently dropping files.
-27. **`gitops.create_branch()` required for --plan mode.** `phase_plan.execute_step()`
+28. **`gitops.create_branch()` required for --plan mode.** `phase_plan.execute_step()`
     calls `gitops.create_branch()` (not `create_loop_branch`). Add if missing.
-28. **GLM-5.2 quota is 80 prompts per rolling 5h (Z.AI Lite).** HTTP 429 after 2-3
+29. **GLM-5.2 quota is 80 prompts per rolling 5h (Z.AI Lite).** HTTP 429 after 2-3
     heavy loops. Recovery: switch to DeepSeek or Claude, or wait 5h.
-29. **User preference — monitor actively or stay silent.** Use polling loops or
+30. **User preference — monitor actively or stay silent.** Use polling loops or
     `notify_on_complete=true`. Never promise to "check back" without following through.
-30. **User preference — quality over speed.** Always use `--thinking high`. Set generous
+31. **User preference — quality over speed.** Always use `--thinking high`. Set generous
     timeouts (`--timeout 2400`). Accept 10-15 min BUILD times.
+32. **Pipeline workdir == Hermes Agent install directory (fork-as-live-install).** When
+    `--workdir` points at the Hermes Agent repo and Hermes is *running that checkout*, the
+    pipeline's git operations (branch creation, checkout, squash-merge) operate on the live
+    codebase. A squash-merge into the parent branch (typically `main`) without `--no-merge`
+    commits the loop output directly into your running Hermes install — which can leave the
+    install in an inconsistent state mid-change. **Always use `--no-merge`** so the loop
+    branch stays isolated for human review and manual merge. After review, merge deliberately:
+    `git checkout main && git merge --squash <loop-branch>`. Also, auto-stash of dirty trees
+    (pitfall #5) is riskier here: a stash-pop conflict during the pipeline aborts with exit 1
+    and leaves the working tree in a mixed state while Hermes is trying to run from those same
+    files. Pre-commit or stash manually before launching. See `references/fork-as-live-install.md`.
+
+33. **`.gitignore` auto-modification leaks into upstream PRs.** The pipeline's PHASE 0
+    appends `--out` patterns (`.adversarial-loop/` by default) to `.gitignore` so artifacts
+    never get tracked. This is correct for local development, but the `.gitignore` change
+    ends up in every BUILD commit (via `git add -A`) and propagates into the squash merge.
+    When the loop output is destined for an upstream PR, **drop the `.gitignore` delta before
+    pushing**. After squash-merge into the parent branch: check with
+    `git diff HEAD~1..HEAD -- .gitignore`; if it shows artifact patterns, restore the
+    upstream version with `git checkout HEAD -- .gitignore` and amend:
+    `git commit --amend --no-edit`. For `--no-merge` loops: inspect `.gitignore` before the
+    manual merge — the upstream `.gitignore` likely already has `target/` etc., so a diff
+    showing only `.adversarial-loop/`, `*.orig`, `*.rej` is the signal.
+    See `references/pre-pr-cleanup.md`.
+
+34. **Keep REVIEW/VERIFY timeout propagation wired end to end.** `run_review()` and
+    `run_verify()` accept a `timeout` parameter and pass it to `providers.run_cmd()`;
+    both call sites in `adversarial_loop.py` pass `timeout=args.timeout`. This makes the
+    pipeline's `--timeout` apply to all five phases. Preserve all three links when
+    changing phase signatures or dispatch. A regression causes Claude Fable 5 REVIEW or
+    VERIFY to fail with `exit code 124: TIMEOUT after 600s` even when the caller passed
+    `--timeout 2400`. See `references/fable5-timeout-recovery.md` for the validated
+    reproduction and implementation details.
+
+35. **Plan-mode reviewer model fallback mid-pipeline.** When running a multi-step `--plan`
+    pipeline and the REVIEW model hits quota exhaustion (Claude's 5h sliding window or
+    Codex's monthly cap), the pipeline must be killed, artifacts cleaned, and relaunched
+    with a different `--review-cmd`. **Procedure (validated 2026-07-13):**
+    1. Kill the background process (`process(action="kill", session_id=...)`).
+    2. Clean artifacts: `rm -rf .adversarial-loop` and delete orphaned loop branches
+       (`git branch -D loop/<feature>/<step>/<N>`). Return to `main`.
+    3. Create a **reduced plan** with only the remaining steps and `Dependencies: []`
+       for any dep that was already merged (the parser validates against the plan's own
+       step IDs). Use a different `--feature` name.
+    4. Relaunch with `--review-cmd` pointing to the fallback model:
+       - **Claude → GLM-5.2**: `pi -p --provider zai --model glm-5.2 --thinking high`
+         (no `--cwd` needed — pi's own file tools handle it).
+       - **GLM/DeepSeek → Claude**: the reverse.
+       - **Stop entirely** if both Codex (DEV) and GLM (review fallback) quotas are
+         exhausted — no viable agent combo remains; resume later.
+    5. The user's instruction for this session: "si quota Claude epuisé → GLM, si GLM ou
+       Codex epuisé → STOP, on reprend plus tard."
+    GLM-5.2 reviews are ~3x faster than Claude Fable 5 (no extended thinking) and
+    reliably output JSON, making it the preferred fallback for REVIEW when Claude quota
+    is low. Validated on 7 completed steps with Claude + 1 attempted step (P8, timeout)
+    before switching to GLM.
+
+36. **Plan resume after partial completion: always check step count.** The plan orchestrator
+    emits `"status": "passed"` for completed steps and `"status": "skipped"` for the rest.
+    When creating a reduced plan:
+    - Include only the remaining steps in document order.
+    - Set `Dependencies: []` for steps whose original dependencies are already merged.
+    - Steps in the reduced plan can be renumbered or keep original IDs — IDs are scoped to
+      the plan file, and `validate_steps()` only checks that referenced dep IDs exist within
+      it. Original IDs make it easier to cross-reference with the adversarial-review findings.
+    - **Risks:** P14 and P15 were split from P8 and P10 during adversarial-plan, so their
+      IDs are out of sequence (P14 after P8, P15 after P10). Keep the original numbering
+      to avoid confusion with the finding-to-step map.
+
+37. **Squash commit naming for upstream PRs.** The pipeline's merge commit message format is
+    `"squash: <feature> — adversarial approved"` (individual BUILD commits use
+    `"build: <feature> — <summary>"`, FIX commits use
+    `"fix: <feature> — address finding(s) (round N)"`). These are pipeline-internal names
+    that don't follow conventional commits, and upstream reviewers will flag them. After
+    squash-merge into the parent branch, rewrite the squash commit:
+    `git commit --amend -m "feat(cli): add on_status_bar_render hook to narrow width tier"`.
+    For multi-step plan outputs with several squashes stacked, either rebase and reword each,
+    or squash them all into one conventional-format commit before pushing the branch upstream.
+    Always verify the final commit message with `git log --oneline -1` before `git push`.
+    See `references/pre-pr-cleanup.md`.
+
+38. **`pi` (GLM-5.2) can review the wrong git repo despite correct `cwd`.** Unlike claude-tmux (which needs `--cwd`, pitfall #26), `pi` runs inside `subprocess.Popen(cwd=workdir)` — but its internal file-access tools may navigate to a different repository. **Symptom:** the REVIEW finding references a commit hash and file paths that don't exist in `--workdir` (e.g., from `hermes-agent` instead of a plugin repo), claiming an empty diff. **Diagnosis:** check `02_review.json` — if the `"file"` field says `"(commit 92ce650...)"` instead of a real file path in your project, pi is in the wrong repo. **Workaround:** merge the BUILD manually (`git merge --squash <loop-branch>`); the code on the loop branch is correct, only the review was misdirected. This was validated 2026-07-13 on a 320-line keyring-hardening step where GLM reviewed the hermes-agent repo instead of the plugin repo. After manual merge the code compiled and all 149 tests passed.
 
 v3 is preserved verbatim as `scripts/adversarial_loop_v3.py` for one release. To migrate:
 
@@ -476,7 +574,51 @@ a stdin concatenation.
 - `references/prompt-injection-threat-model.md` — attack surface + mitigations for untrusted inputs
 - `references/glm5-pi-prose-behavior.md`, `references/pi-sentinel-limitation.md` — pi/GLM failure modes
 - `references/claude-p-migration-pattern.md`, `references/wrapper-failures.md` — Claude wrapper notes
+- `references/full-pipeline-validated.md` — end-to-end validation of brief→spec→plan→code (10-step --plan mode, Codex DEV + Claude/DeepSeek REVIEW, 2026-07-08)
+- `references/partial-merge-gap-fill.md` — gap-matrix workflow when the upstream already has a partial implementation of your targeted feature (gap analysis → gap-focused spec → plan → code loop)
 - Smit et al. (ICML 2024) "Should we be going MAD?"; Du et al. (ICML 2024)
+
+## Resuming a failed --plan pipeline
+
+When a multi-step `--plan` pipeline exits code 3 (REJECT) mid-way, the completed
+steps are already squash-merged into the parent branch. To resume:
+
+1. **Check completed steps:** `git log --oneline -5` shows squash commits for each
+   approved step.
+2. **Check the plan orchestrator state** at `<--out>/<feature>/state.json`. If
+   `verdict: REJECT` and no steps show `status: completed`, the first step failed
+   before any merge — no salvage is needed, just clean and retry.
+3. **Clean up on first-step failure** (nothing was merged): delete the artifacts
+   directory (`rm -rf .adversarial-loop`), delete the orphaned loop branch
+   (`git branch -D loop/<feature>/<step>/<N>`), and verify `.gitignore` was not
+   polluted by the pipeline's auto-append. Then relaunch fresh with the fix
+   (typically increased timeouts — see pitfall #4).
+4. **Create a reduced plan for mid-plan failure:** copy the remaining steps from
+   the original plan into a new file. Remove all dependencies on already-merged
+   steps by setting them to `[]` — the plan parser validates dependencies against
+   the plan's own step IDs only.
+5. **Relaunch with reduced plan:** use the same `--dev-cmd`, `--review-cmd`, and
+   `--out`. Use a different `--feature` name (e.g. `--feature my-feature-rest`)
+   to avoid branch collisions with the rejected run.
+6. **Build + test gates:** always include `--build-cmd` and `--test-cmd` to catch
+   breakage early.
+7. **If Claude times out on VERIFY:** switch `--review-cmd` from claude-tmux to
+   GLM-5.2 (`pi -p --provider zai --model glm-5.2 --thinking high`). GLM is ~3x
+   faster per phase, has no extended-thinking pauses, and has been validated across
+   6+ code loop steps.
+
+### Validated model pairings (2026-07)
+
+| Role | Primary | Fallback (quota/timeout) |
+|------|---------|--------------------------|
+| DEV (BUILD/FIX) | `codex exec -c model='gpt-5.6-sol' -c model_reasoning_effort='high'` | `pi -p --provider zai --model glm-5.2 --thinking high` |
+| REVIEW (CRITIC/VERIFIER) | Claude Fable 5 via tmux | GLM-5.2 (`pi -p --provider zai --model glm-5.2`) |
+| CHALLENGER (spec/plan) | Claude Fable 5 via tmux | DeepSeek V4 Pro or GLM-5.2 |
+
+All three pairings validated end-to-end on 10-step plan across all 3 adversarial
+stages (spec → plan → code loop), 1 cycle each. Claude succeeded at both the
+files-on-disk review pattern (code loop) and the embedded-prompt JSON pattern
+(spec/plan challenger).
 
 ## Retrospective logging
 
