@@ -150,10 +150,10 @@ Le token OAuth est stocké par `agy` dans `~/.gemini/oauth_creds.json` (refresh_
 **Détails OAuth agy :** agy utilise **PKCE** (Proof Key for Code Exchange) pour l'authentification
 — pas de `client_secret`. Le binaire contient les credentials OAuth suivants :
 - Client ID : `884354919052-36trc1jjb3tguiac32ov6cod268c5blh.apps.googleusercontent.com`
-- Client secret : `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`
+- Client secret : `[GOOGLE_CLOUD_CODE_CLIENT_SECRET]`
 - ※ Impossible de rafraîchir le `refresh_token` d'agy en externe car émis par une app OAuth Google différente (consumer auth). Tentatives → `unauthorized_client`.
 
-**antigravity-usage** a son propre flux OAuth (client ID distinct : `1071006060591-tmhssin2h21lcre235vtolojh4g403ep`).
+**antigravity-usage** a son propre flux OAuth (client ID distinct : `1071006060591-tmhssin2h21lcre235vtolojh4g403ep` — installed-app public credential, not confidential).
 Il nécessite un `login` one-time séparé (n'utilise pas les tokens d'agy) :
 ```bash
 npm install -g antigravity-usage   # ou via npx
