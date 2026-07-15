@@ -18,6 +18,25 @@ __all__ = ["run_verify"]
 
 _VALID_VERDICTS = {"APPROVE", "REJECT"}
 _VALID_STATUS = {"resolved", "rejected", "disputed"}
+_VALID_CONFIDENCE = {"high", "medium", "low"}
+_VALID_BASIS = {"spec", "code", "inference", "external"}
+
+
+def _valid_distribution(distribution: Any) -> bool:
+    if not isinstance(distribution, dict):
+        return False
+    expected = {
+        "confidence": _VALID_CONFIDENCE,
+        "basis": _VALID_BASIS,
+    }
+    for category, labels in expected.items():
+        counts = distribution.get(category)
+        if not isinstance(counts, dict) or set(counts) != labels:
+            return False
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in counts.values()):
+            return False
+    return True
 
 
 def _validate(payload: Any) -> bool:
@@ -25,13 +44,23 @@ def _validate(payload: Any) -> bool:
         return False
     if payload.get("verdict") not in _VALID_VERDICTS:
         return False
+    if not _valid_distribution(payload.get("epistemic_distribution")):
+        return False
     results = payload.get("results")
     if not isinstance(results, list):
-        return results is None or len(results) == 0  # empty = treat as unresolved
+        return False
     for item in results:
         if not isinstance(item, dict):
             return False
         if item.get("status") not in _VALID_STATUS:
+            return False
+        if not isinstance(item.get("id"), str) or not item["id"].strip():
+            return False
+        if not isinstance(item.get("evidence"), str):
+            return False
+        if item.get("confidence") not in _VALID_CONFIDENCE:
+            return False
+        if item.get("basis") not in _VALID_BASIS:
             return False
     return True
 
@@ -48,8 +77,7 @@ def run_verify(
     execution: Mapping[str, Any] | None = None,
     ledger: Any = None,
 ) -> dict:
-    """
-    Run VERIFY model with project access to the loop branch.
+    """Run VERIFY model with project access to the loop branch.
 
     The verifier reads findings from review JSON, explores the code on disk,
     runs ``git diff <branch-point>..HEAD`` to see changes, and outputs per-finding
@@ -79,7 +107,12 @@ def run_verify(
         f"Findings:\n{json.dumps(findings, indent=2)}\n\n"
         "Output ONLY valid JSON:\n"
         '{"results": [{"id": "A1", "status": "resolved|rejected|disputed", '
-        '"note": "optional"}], "verdict": "APPROVE|REJECT"}'
+        '"evidence": "concrete evidence", "confidence": "high|medium|low", '
+        '"basis": "spec|code|inference|external"}], '
+        '"epistemic_distribution": {"confidence": {"high": 0, "medium": 0, '
+        '"low": 0}, "basis": {"spec": 0, "code": 0, "inference": 0, '
+        '"external": 0}}, "summary": "N resolved, N rejected, N disputed", '
+        '"verdict": "APPROVE|REJECT"}'
     )
 
     runtime_calls = []
@@ -113,7 +146,6 @@ def run_verify(
                 "execution": merge_runtime(runtime_calls),
             }
         if not _validate(payload):
-            # retry with stricter instruction
             payload, err, stdout = _attempt(
                 prompt + "\n\nIMPORTANT: Respond with raw JSON only. "
                 "No markdown, no code fences, no explanations."
@@ -135,6 +167,8 @@ def run_verify(
             "phase": "verify", "exit_code": 0,
             "results": payload.get("results", []),
             "verdict": payload.get("verdict", "REJECT"),
+            "epistemic_distribution": payload["epistemic_distribution"],
+            "summary": payload.get("summary", ""),
             "stdout": stdout,
             "warnings": merge_warnings(payload, parse_warnings),
             "execution": merge_runtime(runtime_calls),

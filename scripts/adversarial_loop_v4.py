@@ -19,9 +19,12 @@ Exit codes:
 The machine-readable contract is <out>/<feature>/final.json.
 """
 import argparse
+import concurrent.futures
 import json
 import os
+import shutil
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -340,6 +343,195 @@ def _replace_gate_finding(findings, gate_finding):
     ] + [gate_finding]
 
 
+# --- partition & concurrent batches (R7) -------------------------------------
+
+def _partition_findings_by_file(findings):
+    """Partition *findings* into file-disjoint groups.
+
+    Two findings that share a filename land in the same group; findings
+    that touch disjoint files are placed in independent groups that can
+    be fixed concurrently without conflicts.
+    """
+    # Union-find: two findings are linked if they share a file.
+    parent = list(range(len(findings)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    file_to_indices = {}
+    for i, f in enumerate(findings):
+        name = (f.get("file") or "").strip()
+        indices = file_to_indices.setdefault(name, [])
+        if indices:
+            _union(indices[0], i)
+        indices.append(i)
+
+    root_groups = {}
+    for i, f in enumerate(findings):
+        root_groups.setdefault(_find(i), []).append(f)
+
+    return list(root_groups.values())
+
+
+def _run_concurrent_fix_verify_round(
+    findings, dev_cmd, review_cmd, workdir, feature, loop_n,
+    timeout, providers, execution, ledger, verification_cmd,
+    branch_point, max_workers, out_dir, state, args,
+):
+    """Run one FIX-to-VERIFY round concurrently in isolated worktrees.
+
+    Findings are partitioned into file-disjoint groups. Each group runs
+    its own FIX then VERIFY in a dedicated worktree. Successful worktree
+    commits are cherry-picked back into the main worktree in order. All
+    worktrees are cleaned up on any exit path.
+    """
+    groups = _partition_findings_by_file(findings)
+    workers = min(len(groups), max_workers)
+
+    wt_base = Path(out_dir) / "worktrees"
+    # Clean up any stale worktrees from a prior interrupted run.
+    if wt_base.exists():
+        shutil.rmtree(str(wt_base), ignore_errors=True)
+    wt_base.mkdir(parents=True, exist_ok=True)
+
+    lock = threading.Lock()
+    group_results = {}     # group_index -> result dict
+    worktree_infos = []    # [(wt_path, branch_name)]
+
+    def _process_group(idx, group):
+        wt_path = wt_base / f"wt-{idx}"
+        branch = f"loop/{feature}/fix-{loop_n}/g{idx}"
+
+        try:
+            gitops.create_worktree(workdir, str(wt_path), "HEAD", branch)
+            with lock:
+                worktree_infos.append((str(wt_path), branch))
+
+            fix = phase_fix.run_fix(
+                group, dev_cmd, str(wt_path), timeout,
+                feature, loop_n, providers,
+                execution=execution, ledger=ledger,
+            )
+            # Record per-group fix artifact
+            _write_json(out_dir, f"03_fix_{loop_n}_g{idx}.json", fix)
+
+            if fix.get("exit_code") != 0:
+                return idx, {"fix": fix, "verify": None,
+                             "group_size": len(group),
+                             "error": fix.get("error", "FIX failed")}
+
+            wt_diff = gitops.get_diff(str(wt_path), branch_point)
+            verify = phase_verify.run_verify(
+                group, wt_diff, review_cmd, providers, jsonio,
+                timeout=timeout, workdir=str(wt_path),
+                branch_point=branch_point,
+                execution=execution, ledger=ledger,
+            )
+            _write_json(out_dir, f"04_verdict_{loop_n}_g{idx}.json", verify)
+
+            return idx, {"fix": fix, "verify": verify,
+                         "group_size": len(group), "branch": branch}
+        except Exception as exc:
+            return idx, {"error": str(exc), "group_size": len(group)}
+
+    _banner(
+        f"FIX+VERIFY (round {loop_n}/{args.max_loops}) "
+        f"— {workers} worker(s), {len(groups)} group(s)"
+    )
+
+    try:
+        # Run all groups concurrently (capped at max_workers).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_process_group, i, g): i for i, g in enumerate(groups)}
+            for fut in concurrent.futures.as_completed(futs):
+                idx, result = fut.result()
+                with lock:
+                    group_results[idx] = result
+
+        # Cherry-pick successful worktree commits back in order.
+        for idx in sorted(group_results):
+            result = group_results[idx]
+            branch = result.get("branch")
+            if not branch or result.get("error"):
+                continue
+            try:
+                gitops.checkout(workdir, state["branch"])
+                gitops.cherry_pick(workdir, branch)
+            except gitops.GitError as exc:
+                result["merge_error"] = str(exc)
+    finally:
+        # ponytail: cleanup on any exit path (success, failure, interrupt).
+        # Keep this outside the try body so an aggregate block is one shot.
+        for wt_path, branch in worktree_infos:
+            try:
+                gitops.remove_worktree(workdir, str(wt_path))
+            except Exception:
+                pass
+            try:
+                gitops.delete_branch(workdir, branch)
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(str(wt_base), ignore_errors=True)
+        except Exception:
+            pass
+
+    # --- Aggregate results ---
+    all_verify_results = []
+    group_fix_errors = []
+
+    for idx in sorted(group_results):
+        result = group_results[idx]
+        fix = result.get("fix") or {}
+        if fix.get("exit_code") != 0 or result.get("error"):
+            group_fix_errors.append(idx)
+        verify = result.get("verify") or {}
+        all_verify_results.extend(verify.get("results", []))
+        # Findings in groups that failed fix or merge are marked disputed.
+        if result.get("error") or result.get("merge_error"):
+            reason = result.get("error") or result.get("merge_error", "unknown")
+            for f in groups[idx]:
+                all_verify_results.append({
+                    "id": f["id"], "status": "disputed",
+                    "evidence": f"FIX group failed: {reason[:200]}",
+                    "confidence": "medium", "basis": "inference",
+                })
+
+    # Combined fix artifact
+    fix_exit = 0 if not group_fix_errors else 1
+    combined_fix = {
+        "phase": "fix", "loop": loop_n, "exit_code": fix_exit,
+        "groups": len(groups), "group_results": [
+            group_results[i].get("fix", {}) for i in sorted(group_results)
+        ],
+        "group_errors": group_fix_errors,
+        "concurrent": True, "workers": workers,
+    }
+
+    # Combined verify artifact
+    all_verdict = "APPROVE" if (
+        all_verify_results and
+        all(r.get("status") in _SETTLED_STATUSES for r in all_verify_results)
+    ) else "REJECT"
+    combined_verify = {
+        "phase": "verify", "exit_code": 0,
+        "results": all_verify_results,
+        "verdict": all_verdict,
+        "groups": len(groups),
+        "concurrent": True, "workers": workers,
+    }
+
+    return combined_fix, combined_verify
+
+
 # --- gates & helpers ----------------------------------------------------------
 
 
@@ -383,6 +575,14 @@ def _phase_failed(label, result, state, out_dir):
 
 def _restore(workdir, state, out_dir):
     """Best-effort cleanup on every exit path: back to parent, pop stash."""
+    # ponytail: purge orphaned worktrees from prior interrupted concurrent runs.
+    wt_base = Path(out_dir) / "worktrees"
+    if wt_base.exists():
+        try:
+            shutil.rmtree(str(wt_base), ignore_errors=True)
+        except Exception:
+            pass
+
     parent = state.get("parent_branch", "")
     try:
         if parent and gitops.get_current_branch(workdir) != parent:
@@ -627,12 +827,58 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
     conditions = []
     loops_run = state.get("loop", 0)
 
+    # R5 complexity cap for concurrent workers.
+    complexity = state.get("complexity", {})
+    max_concurrent = complexity.get("recommended_agents", args.max_agents)
+
     for n in range(1, args.max_loops + 1):
         if approved or not findings:
             break
         loops_run = n
         fix_path = Path(out_dir) / f"03_fix_{n}.json"
 
+        # --- Determine whether to run concurrent batches ---
+        groups = _partition_findings_by_file(findings)
+        use_concurrent = len(groups) > 1 and not (
+            f"fix_{n}" in completed or f"verify_{n}" in completed
+        )
+
+        if use_concurrent:
+            # --- Concurrent FIX+VERIFY round ---
+            fix, verify = _run_concurrent_fix_verify_round(
+                findings, dev_cmd, review_cmd, workdir, feature, n,
+                args.timeout, providers, execution, ledger,
+                verification_cmd, branch_point,
+                max_concurrent, out_dir, state, args,
+            )
+            _record_phase(state, f"fix_{n}", fix, ledger)
+            _record_phase(state, f"verify_{n}", verify, ledger)
+            _write_json(out_dir, fix_path.name, fix)
+            _write_json(out_dir, f"04_verdict_{n}.json", verify)
+            if fix["exit_code"] != 0:
+                print(f"  ! {len(fix.get('group_errors', []))} group(s) failed FIX")
+            _mark(state, out_dir, f"fix_{n}", loop=n)
+
+            # Concurrent rounds always run both phases; no separate gate.
+            results = verify.get("results", [])
+            verdict = verify.get("verdict", "REJECT")
+            remaining = _unresolved(findings, results)
+            all_settled = bool(results) and not remaining
+            print(f"  Verdict {verdict} — "
+                  f"{len(findings) - len(remaining)}/{len(findings)} settled")
+
+            if verdict == "APPROVE" and all_settled:
+                approved = True
+                _mark(state, out_dir, f"verify_{n}", loop=n, findings=findings)
+                break
+
+            if remaining:
+                findings = remaining
+            _normalize_findings(findings, state)
+            _mark(state, out_dir, f"verify_{n}", loop=n, findings=findings)
+            continue
+
+        # --- Sequential FIX (original path) ---
         if f"fix_{n}" in completed:
             fix = _read_json(fix_path) or {}
         else:

@@ -1,7 +1,7 @@
 ---
 name: adversarial-code-loop
-description: "BUILD → REVIEW → (FIX → VERIFY)^N → ARBITER on isolated git branches. Git-native: each loop runs on its own branch, changes are committed, reviews inspect git diffs."
-version: 4.0.0
+description: "BUILD → REVIEW → (FIX → VERIFY)^N → ARBITER on isolated git branches. Git-native: each loop runs on its own branch, changes are committed, reviews inspect git diffs. NOTE: `--plan` mode documented below is NOT wired in the Python code (see pitfall #1)."
+version: 4.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos]
@@ -281,7 +281,9 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
 
 ## Pitfalls
 
-1. **Codex `--sandbox read-only` vs `--dangerously-bypass-approvals-and-sandbox`.** When
+1. **`--plan` mode is NOT wired into `adversarial_loop_v4.py`'s argparse.** The SKILL.md documents `--plan` mode (multi-step plan execution) but the actual Python code has no `--plan` argument. The `adversarial_loop.py` (which re-exports v4) only accepts `--spec`. The `phase_plan.py` module has `execute_step()` but no CLI entry point or plan-detection logic. **Symptom:** `adversarial_loop.py: error: the following arguments are required: --spec` when passing `--plan`. **Fix:** run each step as a separate code loop with `--spec` pointed at a focused spec for that step. Create individual specs from plan steps P1, P2, etc., and launch sequentially. Do NOT rely on the documented `--plan` mode — it is not implemented as of 2026-07-15. **Validated** 2026-07-15: `adversarial_loop.py --plan /tmp/plan.md` fails with `error: the following arguments are required: --spec`.
+
+1b. **Codex `--sandbox read-only` vs `--dangerously-bypass-approvals-and-sandbox`.** When
    Codex is the REVIEWER and you add `--dangerously-bypass-approvals-and-sandbox`, it
    silently overrides `--sandbox read-only` to `--sandbox danger-full-access`, giving the
    reviewer write access — the opposite of what you want. **Fix:** for read-only review
@@ -388,6 +390,8 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
     `notify_on_complete=true`. Passive promises without follow-through frustrate
     the user. Either monitor actively with a polling loop, or say nothing and let the
     notification fire. See `references/monitoring-long-running-loops.md`.
+    **Validated 2026-07-14:** the user called out the agent twice in one session for saying \"I'll check back\" without doing it. The agent said \"je revérifie dans 3 min\" and the reply was \"tu as encore menti\". This is a hard constraint: either launch a real polling loop now, or use notify_on_complete and stay silent. Never end a turn with a future-monitoring promise.
+
     **Concrete pattern that was validated:** launch with
     `terminal(background=true, notify_on_complete=true)` and do other work. When
     mid-run progress checks are needed, use a compact `for` loop with `sleep 30`
@@ -468,7 +472,7 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
 28. **`gitops.create_branch()` required for --plan mode.** `phase_plan.execute_step()`
     calls `gitops.create_branch()` (not `create_loop_branch`). Add if missing.
 29. **GLM-5.2 quota is 80 prompts per rolling 5h (Z.AI Lite).** HTTP 429 after 2-3
-    heavy loops. Recovery: switch to DeepSeek or Claude, or wait 5h.
+    heavy loops. Recovery: switch to DeepSeek V4 Pro (`pi -p --provider deepseek --model deepseek-v4-pro --thinking high`) for DEV, or Claude Sonnet for REVIEW. If all providers exhausted, wait 5h for GLM reset.
 30. **User preference — monitor actively or stay silent.** Use polling loops or
     `notify_on_complete=true`. Never promise to "check back" without following through.
 31. **User preference — quality over speed.** Always use `--thinking high`. Set generous
@@ -507,7 +511,7 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
     `--timeout 2400`. See `references/fable5-timeout-recovery.md` for the validated
     reproduction and implementation details.
 
-35. **Plan-mode reviewer model fallback mid-pipeline.** When running a multi-step `--plan`
+35. **claude-tmux wrapper must NOT modify the pipeline prompt.** The wrapper exists to\n    capture output via tmux (5h sliding quota) instead of `claude -p` (Agent SDK monthly\n    cap). Its only addition to the pipeline's stdin is the output-capture instruction —\n    *never* prepend or append behavioral modifiers like \"Do NOT run shell commands\" or\n    \"Output ONLY JSON\". The pipeline already sends those instructions. Adding them\n    duplicates (and can contradict) the pipeline's prompt, causing Claude to produce\n    prose instead of JSON or run commands the pipeline didn't want run.\n    **Symptom:** CHALLENGE phase fails with `\"invalid JSON after retry\"` because Claude\n    received conflicting instructions. **Fix:** the wrapper must use exactly this pattern:\n    ```\n    prompt += f\"\\n\\nWhen you are done, write your response to {output_file} \"\n    prompt += f\"using the Write tool. After the file is written, create an empty \"\n    prompt += f\"file at {done_sentinel} to signal completion.\"\n    ```\n    No `+ prompt = \"Do NOT...\"` or `+ prompt += \"Write the exact output...\"`.\n    See `references/claude-tmux-prompt-hygiene.md` for the validated v2 wrapper\n    implementation and restoration instructions.\n\n36. **Plan-mode reviewer model fallback mid-pipeline.** When running a multi-step `--plan`
     pipeline and the REVIEW model hits quota exhaustion (Claude's 5h sliding window or
     Codex's monthly cap), the pipeline must be killed, artifacts cleaned, and relaunched
     with a different `--review-cmd`. **Procedure (validated 2026-07-13):**
@@ -556,6 +560,10 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
 
 38. **`pi` (GLM-5.2) can review the wrong git repo despite correct `cwd`.** Unlike claude-tmux (which needs `--cwd`, pitfall #26), `pi` runs inside `subprocess.Popen(cwd=workdir)` — but its internal file-access tools may navigate to a different repository. **Symptom:** the REVIEW finding references a commit hash and file paths that don't exist in `--workdir` (e.g., from `hermes-agent` instead of a plugin repo), claiming an empty diff. **Diagnosis:** check `02_review.json` — if the `"file"` field says `"(commit 92ce650...)"` instead of a real file path in your project, pi is in the wrong repo. **Workaround:** merge the BUILD manually (`git merge --squash <loop-branch>`); the code on the loop branch is correct, only the review was misdirected. This was validated 2026-07-13 on a 320-line keyring-hardening step where GLM reviewed the hermes-agent repo instead of the plugin repo. After manual merge the code compiled and all 149 tests passed.
 
+39. **Fable 5 has its own usage limit separate from Claude Pro's 5h sliding quota.** The model can be blocked even when regular Claude Pro quota is green. **Symptom:** claude-tmux starts, bypasses permissions, reads the prompt, then displays "You've reached your Fable 5 limit" and stops. **Fix:** switch to `--model sonnet` or `--model opus`. Sonnet is preferred for plan-challenger and code-loop REVIEW because it has no extended thinking (faster response, no 12-min silence), reliable JSON output, and lower token cost. See `references/fable5-usage-limit.md`. **Validated:** 2026-07-15 — Fable 5 hit limit mid-challenge; Sonnet completed in ~2 min.
+
+40. Codex FIX phase hangs on stdin when the spec is small or findings are minor. Codex prints Reading prompt from stdin... and blocks forever when its generated input does not constitute a complete code-generation request. Symptom: BUILD succeeds, REVIEW returns findings, but FIX exits 1 with Reading prompt from stdin... as the only output. Root cause: the FIX phase embeds findings into a prompt Codex expects to be a full coding task; narrow specs with minor findings can leave Codex waiting. Mitigation (validated 2026-07-15): switch --dev-cmd from Codex to GLM-5.2 (pi -p --provider zai --model glm-5.2 --thinking high) for the problematic step. GLM reliably handles FIX prompts without stdin hang. Permanent fix: ensure the FIX prompt always includes a concrete code-generation request with file paths and expected diff pattern.
+
 v3 is preserved verbatim as `scripts/adversarial_loop_v3.py` for one release. To migrate:
 
 **New flags:** `--build-cmd`, `--test-cmd` (objective gates), `--no-merge`, `--feature`,
@@ -596,7 +604,7 @@ a stdin concatenation.
 - `references/batch-splitting-strategy.md` — review-first → batch dev loops (parallel vs sequential)
 - `references/prompt-injection-threat-model.md` — attack surface + mitigations for untrusted inputs
 - `references/glm5-pi-prose-behavior.md`, `references/pi-sentinel-limitation.md` — pi/GLM failure modes
-- `references/claude-p-migration-pattern.md`, `references/wrapper-failures.md` — Claude wrapper notes
+- `references/claude-p-migration-pattern.md`, `references/wrapper-failures.md`, `references/claude-tmux-adversarial-review.md` — Claude wrapper notes (prompt hygiene, hard_timeout fix, sonnet fallback)
 - `references/full-pipeline-validated.md` — end-to-end validation of brief→spec→plan→code (10-step --plan mode, Codex DEV + Claude/DeepSeek REVIEW, 2026-07-08)
 - `references/partial-merge-gap-fill.md` — gap-matrix workflow when the upstream already has a partial implementation of your targeted feature (gap analysis → gap-focused spec → plan → code loop)
 - `references/github-secret-scanning-bypass.md` — bypass GitHub push protection for public OAuth credentials
@@ -636,9 +644,14 @@ steps are already squash-merged into the parent branch. To resume:
 
 | Role | Primary | Fallback (quota/timeout) |
 |------|---------|--------------------------|
-| DEV (BUILD/FIX) | `codex exec -c model='gpt-5.6-sol' -c model_reasoning_effort='high'` | `pi -p --provider zai --model glm-5.2 --thinking high` |
-| REVIEW (CRITIC/VERIFIER) | Claude Fable 5 via tmux | GLM-5.2 (`pi -p --provider zai --model glm-5.2`) |
-| CHALLENGER (spec/plan) | Claude Fable 5 via tmux | DeepSeek V4 Pro or GLM-5.2 |
+| DEV (BUILD/FIX) | `codex exec -c model='gpt-5.6-sol' -c model_reasoning_effort='high'` | `pi -p --provider zai --model glm-5.2 --thinking high` → `pi -p --provider deepseek --model deepseek-v4-pro --thinking high` |
+| REVIEW (CRITIC/VERIFIER) | Claude Sonnet via tmux (`--timeout 1200 --hard-timeout 1800`) | GLM-5.2 (`pi -p --provider zai --model glm-5.2`) |
+| CHALLENGER (spec/plan) | Claude Sonnet via tmux (reads files from disk, no prompt embedding) | DeepSeek V4 Pro (`pi -p --provider deepseek --model deepseek-v4-pro --thinking high`) or GLM-5.2 |
+
+**Key changes from 2026-07-14:**
+- **Claude Sonnet replaces Fable 5 as default REVIEW/CHALLENGER.** Fable 5 has a separate usage limit from Claude Pro's 5h quota, frequently blocks mid-run, and its extended thinking (8-12 min) makes plan-challenge timeouts common. Sonnet has no extended thinking, responds in ~2 min, produces reliable JSON, and stays on the 5h sliding quota.
+- **DeepSeek V4 Pro is validated as DEV fallback.** When GLM-5.2 hits its 80-prompt/5h limit (Z.AI Lite), DeepSeek V4 Pro with `--thinking high` works as a reliable DEV for BUILD and FIX phases. Validated on P16 (plan integration): BUILD created a valid commit on first attempt.
+- **DEV fallback chain:** Codex → GLM-5.2 → DeepSeek V4 Pro. If all three are exhausted, stop and resume later.
 
 All three pairings validated end-to-end on 10-step plan across all 3 adversarial
 stages (spec → plan → code loop), 1 cycle each. Claude succeeded at both the
@@ -674,8 +687,9 @@ To manually add a note about a limitation you noticed, add an entry at the top o
 
 ## --plan mode (multi-step plans)
 
-v4 supports executing a pre-written plan via `--plan plan.md`. Each step runs as a
-full adversarial loop on its own sub-branch `loop/<feature>/<step_id>/<N>`.
+**⚠️ NOT WIRED — see pitfall #1.** The `--plan` flag does not exist in the actual argparse of `adversarial_loop.py` or `adversarial_loop_v4.py`. The `phase_plan.py` module has `execute_step()` but no CLI entry point or plan-detection logic. Run each plan step as a separate code loop with `--spec` pointed at a focused spec for that step.
+
+The documentation below describes the intended design that would be implemented in v5. It is preserved here for future implementation references.
 
 Plan format (output of `adversarial-plan`):
 
@@ -701,9 +715,4 @@ instead of actual code changes. Prefer single-repo plans where possible.
 
 ## Changelog
 
-- **v4.0.0** (2026-07-06): git-native rewrite. Branch-per-loop isolation, commit-based
-  BUILD/FIX, review on `git diff`, squash-merge / `[REJECTED]` marker, `--resume`, build
-  & test gates, `--no-merge`, `--feature`, evidence tags, auto-stash of dirty trees,
-  `strip_json_wrapper` for markdown-fenced JSON. New findings schema (id/severity/file/
-  line/summary/evidence + verdict); exit 4 = ARBITRATED; exit 5 removed. v3 preserved as
-  `adversarial_loop_v3.py`. This SKILL.md replaces the v3 doc.
+- **v4.1.0** (2026-07-14): Added pitfalls #25b (multi-repo parent repo auto-init), #26 (claude-tmux --cwd required), #34 (REVIEW/VERIFY timeout propagation), #35 (mid-pipeline model fallback), #36 (plan resume after partial completion), #38 (pi wrong repo review). Added references: fable5-timeout-recovery.md, github-secret-scanning-bypass.md, delegate-task-review-timeout.md. Fixed `run_review()` and `run_verify()` timeout propagation bug (timeout defaulted to 600s despite pipeline `--timeout`). Fixed `_fail_phase` → `fail_phase` bug in adversarial_review.py (underscore prefix leaked from runner module).

@@ -25,7 +25,12 @@ from types import SimpleNamespace  # noqa: E402
 
 from adversarial_common import gitops  # noqa: E402
 import adversarial_loop as loop  # noqa: E402
-from adversarial_loop import _ensure_ids, _unresolved, _positive_int  # noqa: E402
+from adversarial_loop import (  # noqa: E402
+    _ensure_ids,
+    _positive_int,
+    _unresolved,
+    _without_gate_findings,
+)
 
 
 def test_f1_ids_unique_and_no_collapse():
@@ -55,6 +60,199 @@ def test_f8_positive_int():
         except argparse.ArgumentTypeError:
             continue
         raise AssertionError(f"_positive_int accepted {bad!r}")
+
+
+def test_successful_gate_discards_all_stale_gate_findings():
+    review_finding = {"id": "A1", "summary": "real review finding"}
+    stale_gate_findings = [
+        {"id": "GATE-1", "gate": {"ok": False}},
+        {"id": "GATE-2", "gate": {"ok": False}},
+    ]
+
+    assert _without_gate_findings(
+        [review_finding, *stale_gate_findings]
+    ) == [review_finding]
+
+
+def test_later_gate_success_keeps_stale_gate_findings_out_of_verify(
+        tmp_path, monkeypatch):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Requirements\n\nREQ-1: clear recovered gate failures.\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    review_finding = {"id": "A1", "summary": "real review finding"}
+    (out_dir / "02_review.json").write_text(json.dumps({
+        "verdict": "REQUEST_CHANGES", "findings": [review_finding],
+    }))
+    args = SimpleNamespace(
+        spec=str(spec), build_cmd="build-check", test_cmd=None,
+        timeout=10, max_loops=2, no_arbiter=True, no_merge=True,
+    )
+    state = {
+        "completed": [
+            "git_setup", "pre_build_gate", "build", "post_build_gate", "review",
+        ],
+        "parent_branch": "main", "branch": "loop/test", "branch_point": "base",
+        "findings": [review_finding], "loop": 0,
+    }
+    gate_results = iter([
+        {
+            "command": "build-check", "ok": False, "exit_code": 1,
+            "infra": False, "log": "failed once",
+        },
+        {
+            "command": "build-check", "ok": True, "exit_code": 0,
+            "infra": False, "log": "recovered",
+        },
+    ])
+    verified_findings = []
+
+    monkeypatch.setattr(loop.gitops, "checkout", lambda *args: None)
+    monkeypatch.setattr(
+        loop.gates, "post_fix_gate", lambda *args, **kwargs: next(gate_results)
+    )
+    monkeypatch.setattr(
+        loop.phase_fix, "run_fix",
+        lambda *args, **kwargs: {"exit_code": 0, "commit_sha": "abc"},
+    )
+
+    def approve_real_finding(findings, *args, **kwargs):
+        verified_findings.append(findings)
+        return {
+            "exit_code": 0, "verdict": "APPROVE",
+            "results": [{"id": "A1", "status": "resolved"}],
+        }
+
+    monkeypatch.setattr(loop.phase_verify, "run_verify", approve_real_finding)
+    monkeypatch.setattr(loop.gitops, "get_diff", lambda *args: "diff")
+    monkeypatch.setattr(loop, "_finish", lambda *args, **kwargs: loop.EXIT_APPROVED)
+
+    result = loop._pipeline(
+        args, "dev", "review", "", str(tmp_path), "test", out_dir, state
+    )
+
+    assert result == loop.EXIT_APPROVED
+    assert verified_findings == [[review_finding]]
+    assert state["findings"] == [review_finding]
+
+
+def test_build_and_test_commands_use_independent_gates(tmp_path, monkeypatch):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Requirements\n\nREQ-1: keep gates independent.\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "02_review.json").write_text(
+        json.dumps({"verdict": "APPROVE", "findings": []})
+    )
+    args = SimpleNamespace(
+        spec=str(spec), build_cmd="build-check", test_cmd="test-check",
+        timeout=10, max_loops=1, no_arbiter=True, no_merge=True,
+    )
+    state = {
+        "completed": ["git_setup", "build", "review"],
+        "parent_branch": "main", "branch": "loop/test", "branch_point": "base",
+        "findings": [], "loop": 0,
+    }
+    calls = {"pre": [], "build": [], "test": []}
+
+    def successful_gate(name, command):
+        calls[name].append(command)
+        return {
+            "gate": name, "command": command, "ok": True, "exit_code": 0,
+            "infra": False, "log": "", "truncated": False,
+        }
+
+    monkeypatch.setattr(loop.gitops, "checkout", lambda *args: None)
+    monkeypatch.setattr(
+        loop.gates, "pre_build_gate",
+        lambda _workdir, command: successful_gate("pre", command),
+    )
+    monkeypatch.setattr(
+        loop.gates, "post_build_gate",
+        lambda _workdir, command, **kwargs: successful_gate("build", command),
+    )
+    monkeypatch.setattr(
+        loop.gates, "post_fix_gate",
+        lambda _workdir, command, **kwargs: successful_gate("test", command),
+    )
+    monkeypatch.setattr(loop, "_finish", lambda *args, **kwargs: loop.EXIT_APPROVED)
+
+    result = loop._pipeline(
+        args, "dev", "review", "", str(tmp_path), "test", out_dir, state
+    )
+
+    assert result == loop.EXIT_APPROVED
+    assert calls == {
+        "pre": ["build-check"],
+        "build": ["build-check"],
+        "test": ["test-check"],
+    }
+
+
+def test_test_only_command_runs_once_after_approval(tmp_path, monkeypatch):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Requirements\n\nREQ-1: verify every round.\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    finding = {"id": "A1", "summary": "fix this"}
+    (out_dir / "02_review.json").write_text(json.dumps({
+        "verdict": "REQUEST_CHANGES", "findings": [finding],
+    }))
+    args = SimpleNamespace(
+        spec=str(spec), build_cmd=None, test_cmd="test-check",
+        timeout=10, max_loops=1, no_arbiter=True, no_merge=True,
+    )
+    state = {
+        "completed": ["git_setup", "build", "review"],
+        "parent_branch": "main", "branch": "loop/test", "branch_point": "base",
+        "findings": [finding], "loop": 0,
+    }
+    calls = {"pre": [], "post_build": [], "post_fix": []}
+
+    def successful_gate(name, command):
+        calls[name].append(command)
+        return {
+            "gate": name, "command": command, "ok": True, "exit_code": 0,
+            "infra": False, "log": "", "truncated": False,
+        }
+
+    monkeypatch.setattr(loop.gitops, "checkout", lambda *args: None)
+    monkeypatch.setattr(
+        loop.gates, "pre_build_gate",
+        lambda _workdir, command: successful_gate("pre", command),
+    )
+    monkeypatch.setattr(
+        loop.gates, "post_build_gate",
+        lambda _workdir, command, **kwargs: successful_gate("post_build", command),
+    )
+    monkeypatch.setattr(
+        loop.gates, "post_fix_gate",
+        lambda _workdir, command, **kwargs: successful_gate("post_fix", command),
+    )
+    monkeypatch.setattr(
+        loop.phase_fix, "run_fix",
+        lambda *args, **kwargs: {"exit_code": 0, "commit_sha": "abc"},
+    )
+    monkeypatch.setattr(
+        loop.phase_verify, "run_verify",
+        lambda *args, **kwargs: {
+            "exit_code": 0, "verdict": "APPROVE",
+            "results": [{"id": "A1", "status": "resolved"}],
+        },
+    )
+    monkeypatch.setattr(loop.gitops, "get_diff", lambda *args: "diff")
+    monkeypatch.setattr(loop, "_finish", lambda *args, **kwargs: loop.EXIT_APPROVED)
+
+    result = loop._pipeline(
+        args, "dev", "review", "", str(tmp_path), "test", out_dir, state
+    )
+
+    assert result == loop.EXIT_APPROVED
+    assert calls == {
+        "pre": [None],
+        "post_build": [],
+        "post_fix": ["test-check"],
+    }
 
 
 def test_f6_identity_bootstrapped_when_unset():
@@ -109,6 +307,13 @@ def test_merge_failure_returns_infra_and_records_error(tmp_path, monkeypatch):
         "parent_branch": "main",
         "branch": "loop/demo/1",
         "completed": [],
+        "epistemic_labels": {
+            "confidence": {"high": 1, "medium": 0, "low": 0},
+            "basis": {
+                "spec": 0, "code": 1, "inference": 0, "external": 0,
+            },
+        },
+        "warnings": [{"code": "example-warning"}],
     }
 
     code = loop._finish(
@@ -119,6 +324,8 @@ def test_merge_failure_returns_infra_and_records_error(tmp_path, monkeypatch):
     assert code == loop.EXIT_INFRA
     final = json.loads((tmp_path / "final.json").read_text())
     assert final["merged"] is False
+    assert final["epistemic_labels"]["confidence"]["high"] == 1
+    assert final["warnings"] == [{"code": "example-warning"}]
     assert "squash merge" in final["error"]
 
 
@@ -190,6 +397,7 @@ def test_restore_ledger_preserves_estimation_provenance():
 def main():
     test_f1_ids_unique_and_no_collapse()
     test_f8_positive_int()
+    test_successful_gate_discards_all_stale_gate_findings()
     test_f6_identity_bootstrapped_when_unset()
     test_resume_finished_run_does_not_overwrite_final()
     test_restore_ledger_preserves_estimation_provenance()
