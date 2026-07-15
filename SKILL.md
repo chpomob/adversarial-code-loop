@@ -454,7 +454,15 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
        that Codex wrote to disk but that the parent repo swallowed.
     3. Do NOT rely on `--plan` mode for multi-repo plans — use single-repo plans or run
        each step manually.
-    **Validated 2026-07-14** on an 18-step cross-skill plan: steps A1–A14 all passed with
+    **PREVENTION — automatic guard added 2026-07-15 in `gitops.auto_init()`:**
+    `auto_init()` now calls `_has_child_repos(workdir)` before initializing. If the
+    directory contains immediate subdirectories with their own `.git`, it raises
+    `GitError` with a descriptive message listing the child repos and telling the caller
+    to use `--workdir` on a specific repo instead. This prevents the parent-repo
+    destruction from happening in the first place. The guard is in `adversarial-common`
+    package at commit `df0a15e` and affects all pipelines (code-loop, plan, spec) that
+    call `gitops.auto_init()`.
+    **Validated 2026-07-15** on an 18-step cross-skill plan: steps A1–A14 all passed with
     0 loops but the code changes (embedded in the skill subdirectories) were not tracked
     in any skill repo. Only a `rm -rf .git` + manual `git add -A` per skill recovered the
     work.
