@@ -32,7 +32,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR.parent))
 sys.path.insert(0, str(_SCRIPTS_DIR.parent.parent / "adversarial-common"))
 
-from adversarial_common import gitops, jsonio, providers
+from adversarial_common import gates, gitops, jsonio, providers
 from adversarial_common.providers import resolve_role_cmd
 from scripts.phases import (
     phase_arbiter,
@@ -109,56 +109,6 @@ def _ensure_ids(findings):
 
 
 # --- gates & helpers ----------------------------------------------------------
-
-def _kill_gate_group(proc):
-    """SIGKILL the gate's whole process group (shell=True spawns children)."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (OSError, AttributeError):
-        proc.kill()
-
-
-def _run_gate(name, cmd, workdir, timeout):
-    """Run a shell build/test gate in its own process group.
-
-    Returns a dict with 'exit_code'. 'infra' is True when the gate could not
-    be run at all (unstartable command, timeout) — those must surface as
-    infrastructure errors, not as a genuine gate failure of the feature.
-    """
-    _banner(f"GATE  ({name})")
-    print(f"  $ {cmd}")
-    try:
-        proc = subprocess.Popen(
-            cmd, shell=True, cwd=workdir,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            start_new_session=True,
-        )
-    except OSError as exc:
-        return {"gate": name, "cmd": cmd, "exit_code": 126,
-                "infra": True, "error": f"could not start gate: {exc}"}
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_gate_group(proc)
-        proc.wait()
-        return {"gate": name, "cmd": cmd, "exit_code": 124,
-                "infra": True, "error": f"gate timed out after {timeout}s"}
-    except BaseException:
-        # Interrupt mid-gate: reap the whole group before main()'s cleanup
-        # touches the worktree, so nothing races _restore().
-        _kill_gate_group(proc)
-        proc.wait()
-        raise
-    status = "OK" if proc.returncode == 0 else f"FAILED ({proc.returncode})"
-    print(f"  {status}")
-    return {
-        "gate": name,
-        "cmd": cmd,
-        "exit_code": proc.returncode,
-        "stdout": stdout[-4000:],
-        "stderr": stderr[-4000:],
-    }
 
 
 def _terminate_provider_processes():
@@ -262,6 +212,8 @@ def _finish(args, workdir, feature, out_dir, state, verdict,
         conditions=conditions,
         arbitrated=arbitrated,
         artifacts_dir=str(out_dir),
+        gates=state.get("gates", []),
+        complexity=state.get("complexity", {}),
     )
     if fin["exit_code"] != 0:
         # Do NOT mark 'done': leave the run resumable so finalize is retried.
@@ -324,6 +276,20 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
         print(f"X could not read spec {args.spec}: {exc}")
         return EXIT_USAGE
     jsonio.save_artifact(out_dir, "00_spec.txt", spec_text)
+    state["complexity"] = gates.estimate_complexity(spec_text)
+    verification_cmd = args.test_cmd or args.build_cmd
+
+    # The pre-build gate always runs before the first BUILD provider call.
+    if "pre_build_gate" not in completed:
+        gate = gates.pre_build_gate(workdir, verification_cmd)
+        _write_json(out_dir, "00_pre_build_gate.json", gate)
+        state.setdefault("gates", []).append(gate)
+        if not gate["ok"]:
+            if gate.get("infra"):
+                return _phase_failed("pre_build_gate", gate, state, out_dir)
+            return _finish(args, workdir, feature, out_dir, state,
+                           "REJECT", reason="PRE_BUILD_GATE_FAILED")
+        _mark(state, out_dir, "pre_build_gate")
 
     # BUILD
     if "build" not in completed:
@@ -336,16 +302,18 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
         _mark(state, out_dir, "build")
         print(f"  OK commit {result.get('commit_sha', '')[:12]}")
 
-    # Optional build gate — a failing build is a hard REJECT (exit 3), but a
-    # gate that could not run at all (bad command, timeout) is infra (exit 1).
-    if args.build_cmd:
-        gate = _run_gate("build", args.build_cmd, workdir, args.timeout)
-        _write_json(out_dir, "01_build_gate.json", gate)
+    # Verify the real build before REVIEW.
+    if verification_cmd and "post_build_gate" not in completed:
+        gate = gates.post_build_gate(
+            workdir, verification_cmd, timeout=args.timeout)
+        _write_json(out_dir, "01_post_build_gate.json", gate)
+        state.setdefault("gates", []).append(gate)
         if gate.get("infra"):
-            return _phase_failed("build_gate", gate, state, out_dir)
-        if gate["exit_code"] != 0:
+            return _phase_failed("post_build_gate", gate, state, out_dir)
+        if not gate["ok"]:
             return _finish(args, workdir, feature, out_dir, state,
                            "REJECT", reason="BUILD_FAILED")
+        _mark(state, out_dir, "post_build_gate")
 
     # REVIEW
     if "review" in completed:
@@ -393,7 +361,48 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
                 return _phase_failed(f"fix_{n}", fix, state, out_dir)
             _mark(state, out_dir, f"fix_{n}", loop=n)
 
-        if f"verify_{n}" in completed:
+        gate_blocked = False
+        if verification_cmd:
+            gate_name = f"post_fix_gate_{n}"
+            gate_path = Path(out_dir) / f"03_post_fix_gate_{n}.json"
+            if gate_name in completed:
+                gate = _read_json(gate_path) or {}
+            else:
+                gate = gates.post_fix_gate(
+                    workdir, verification_cmd, timeout=args.timeout)
+                _write_json(out_dir, gate_path.name, gate)
+                state.setdefault("gates", []).append(gate)
+                _mark(state, out_dir, gate_name, loop=n)
+            if gate.get("infra"):
+                return _phase_failed(gate_name, gate, state, out_dir)
+            if not gate.get("ok", False):
+                gate_finding = {
+                    "id": f"GATE-{n}",
+                    "severity": "blocker",
+                    "file": "(verification gate)",
+                    "line": 1,
+                    "summary": "Post-fix verification failed",
+                    "evidence": (
+                        f"Command: {gate.get('command', '')}\n"
+                        f"Exit: {gate.get('exit_code')}\n"
+                        f"Log: {gate.get('log', '')}"
+                    ),
+                    "confidence": "high",
+                    "basis": "code",
+                    "gate": gate,
+                }
+                findings = [
+                    finding for finding in findings
+                    if finding.get("id") != gate_finding["id"]
+                ] + [gate_finding]
+                state["findings"] = findings
+                if n < args.max_loops:
+                    continue
+                gate_blocked = True
+
+        if gate_blocked:
+            verify = {"results": [], "verdict": "REJECT", "exit_code": 0}
+        elif f"verify_{n}" in completed:
             verify = _read_json(Path(out_dir) / f"04_verdict_{n}.json") or {}
         else:
             _banner(f"VERIFY  (round {n}/{args.max_loops})")
@@ -454,18 +463,6 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             reason = f"findings unresolved after {args.max_loops} loops"
         else:
             reason = f"review verdict {review_verdict} with no findings"
-
-    # Optional test gate — flips an approval into a rejection; a gate that
-    # could not run at all is an infrastructure error, not a test failure.
-    if approved and args.test_cmd:
-        gate = _run_gate("test", args.test_cmd, workdir, args.timeout)
-        _write_json(out_dir, "06_test_gate.json", gate)
-        if gate.get("infra"):
-            return _phase_failed("test_gate", gate, state, out_dir)
-        if gate["exit_code"] != 0:
-            approved = False
-            arbitrated = False
-            reason = "TEST_FAILED"
 
     if approved:
         verdict = "ARBITRATED" if arbitrated else "APPROVED"

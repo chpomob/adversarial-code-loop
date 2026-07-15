@@ -70,7 +70,8 @@ def _build_prompt(diff_text: str, workdir: str, branch_point: str = "") -> str:
         f"Output ONLY valid JSON:\n"
         f'{{"findings": [{{"id": "A1", "severity": "blocker|major|minor|nit", '
         f'"file": "path", "line": 42, "summary": "...", '
-        f'"evidence": "..."}}], '
+        f'"evidence": "...", "confidence": "high|medium|low", '
+        f'"basis": "spec|code|inference|external"}}], '
         f'"verdict": "REQUEST_CHANGES|APPROVE|REJECT"}}'
     )
 
@@ -103,10 +104,7 @@ def run_review(
         )
         if code != 0:
             return None, f"REVIEW exited {code}: {(stderr or '')[:200]}", stdout
-        try:
-            payload = json.loads(jsonio.strip_json_wrapper(stdout))
-        except (json.JSONDecodeError, ValueError, TypeError):
-            payload = None
+        payload = jsonio.parse_json_output(stdout)
         return payload, None, stdout
 
     try:
@@ -131,6 +129,8 @@ def run_review(
         return {
             "phase": "review", "exit_code": 0,
             "findings": payload["findings"], "verdict": payload["verdict"],
+            "warnings": payload.get("warnings", []),
+            "epistemic_labels": jsonio.epistemic_distribution(payload["findings"]),
             "stdout": stdout,
         }
     except Exception as exc:
