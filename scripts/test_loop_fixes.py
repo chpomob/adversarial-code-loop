@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SKILL_ROOT = os.path.dirname(_HERE)
@@ -121,10 +122,77 @@ def test_merge_failure_returns_infra_and_records_error(tmp_path, monkeypatch):
     assert "squash merge" in final["error"]
 
 
+def test_resume_finished_run_does_not_overwrite_final():
+    """A terminal resume returns before rereading or preflighting the spec."""
+    with tempfile.TemporaryDirectory(prefix="acl-finished-resume-") as tmp:
+        tmp_path = Path(tmp)
+        out_dir = tmp_path / "artifacts" / "demo"
+        out_dir.mkdir(parents=True)
+        state = {
+            "branch": "loop/demo/1",
+            "completed": ["done"],
+            "verdict": "APPROVED",
+            "exit_code": loop.EXIT_APPROVED,
+        }
+        (out_dir / "state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        final_text = '{"verdict": "APPROVED", "sentinel": true}\n'
+        (out_dir / "final.json").write_text(final_text, encoding="utf-8")
+
+        code = loop.main([
+            "--spec", str(tmp_path / "missing-spec.md"),
+            "--workdir", str(tmp_path),
+            "--out", str(tmp_path / "artifacts"),
+            "--feature", "demo",
+            "--resume",
+            "--min-chars", "999999",
+        ])
+
+        assert code == loop.EXIT_APPROVED
+        assert (
+            out_dir / "final.json"
+        ).read_text(encoding="utf-8") == final_text
+
+
+def test_restore_ledger_preserves_estimation_provenance():
+    state = {
+        "costs": {
+            "records": [
+                {
+                    "model": "gpt-5",
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "estimated": True,
+                    "phase": "build",
+                    "persona": "builder",
+                },
+                {
+                    "model": "gpt-5",
+                    "prompt_tokens": 11,
+                    "completion_tokens": 5,
+                    "estimated": False,
+                    "phase": "review",
+                    "persona": "critic",
+                },
+            ]
+        }
+    }
+
+    records = loop._restore_ledger(state).summary()["records"]
+
+    assert records[0]["prompt_tokens"] == 7
+    assert records[0]["completion_tokens"] == 3
+    assert records[0]["estimated"] is True
+    assert records[1]["estimated"] is False
+
+
 def main():
     test_f1_ids_unique_and_no_collapse()
     test_f8_positive_int()
     test_f6_identity_bootstrapped_when_unset()
+    test_resume_finished_run_does_not_overwrite_final()
+    test_restore_ledger_preserves_estimation_provenance()
     print("OK: loop fix regressions pass (F1, F6, F8)")
 
 

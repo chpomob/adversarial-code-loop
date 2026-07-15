@@ -64,6 +64,7 @@ class StubProviders:
             return (json.dumps({
                 "results": [{"id": "A1", "status": "resolved"}],
                 "verdict": "APPROVE",
+                "warnings": ["verifier supplied warning"],
             }), "", 0)
         if role == "judge":
             return (json.dumps({
@@ -119,6 +120,7 @@ def _run_full_flow():
         assert verify["exit_code"] == 0, verify
         assert verify["verdict"] == "APPROVE"
         assert verify["results"][0]["status"] == "resolved"
+        assert verify["warnings"] == ["verifier supplied warning"]
         verify_prompt = next(
             p["text"] for p in providers.prompts if p["role"] == "verifier")
         assert setup["branch_point"] in verify_prompt
