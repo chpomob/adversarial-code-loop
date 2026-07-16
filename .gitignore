@@ -9,3 +9,7 @@ tests/
 .venv/
 .pytest_cache/
 *.py[cod]
+_retrospective/
+references/
+templates/
+IMPLEMENTATION_PLAN.md

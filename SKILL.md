@@ -601,24 +601,6 @@ must write files directly (git-aware personas enforce this). Dirty trees are aut
 not fatal. Empty BUILD diffs are REJECTed as `EMPTY_DIFF`. Review input is a git diff, not
 a stdin concatenation.
 
-## References
-
-- `references/git-workflow-v4.md` — full git design (branch naming, rollback, auto-init, resume)
-- `references/implementation-plan-v4.md` — v4 implementation roadmap
-- `references/spec-writing-for-adversarial-loops.md` — spec structure for single-cycle approvals
-- `references/post-loop-extraction-workflow.md`, `references/timeout-recovery-workflow.md`
-- `references/codex-deepseek-pattern.md`, `references/fable5-reviewer-pattern.md`,
-  `references/codex-AGY-pattern.md` — model pairings
-- `references/batch-splitting-strategy.md` — review-first → batch dev loops (parallel vs sequential)
-- `references/prompt-injection-threat-model.md` — attack surface + mitigations for untrusted inputs
-- `references/glm5-pi-prose-behavior.md`, `references/pi-sentinel-limitation.md` — pi/GLM failure modes
-- `references/claude-p-migration-pattern.md`, `references/wrapper-failures.md`, `references/claude-tmux-adversarial-review.md` — Claude wrapper notes (prompt hygiene, hard_timeout fix, sonnet fallback)
-- `references/full-pipeline-validated.md` — end-to-end validation of brief→spec→plan→code (10-step --plan mode, Codex DEV + Claude/DeepSeek REVIEW, 2026-07-08)
-- `references/partial-merge-gap-fill.md` — gap-matrix workflow when the upstream already has a partial implementation of your targeted feature (gap analysis → gap-focused spec → plan → code loop)
-- `references/github-secret-scanning-bypass.md` — bypass GitHub push protection for public OAuth credentials
-- `references/delegate-task-review-timeout.md` — why delegate_task CANNOT run long adversarial reviews
-- Smit et al. (ICML 2024) "Should we be going MAD?"; Du et al. (ICML 2024)
-
 ## Resuming a failed --plan pipeline
 
 When a multi-step `--plan` pipeline exits code 3 (REJECT) mid-way, the completed
