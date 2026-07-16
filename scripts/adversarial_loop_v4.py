@@ -36,9 +36,13 @@ sys.path.insert(0, str(_SCRIPTS_DIR.parent.parent / "adversarial-common"))
 
 from adversarial_common import (
     CostLedger,
+    NoProviderAvailable,
+    ProviderConfigError,
+    QuotaResolver,
     gates,
     gitops,
     jsonio,
+    load_provider_config,
     providers,
     runner,
 )
@@ -80,6 +84,7 @@ _THRESHOLD_ENV = {
     ),
 }
 _GATE_FINDING_ID = "GATE-VERIFICATION"
+_FORCE_PROVIDER_ROLES = frozenset({"dev", "review", "verify", "arbiter"})
 
 
 # --- small JSON/state helpers -----------------------------------------------
@@ -297,9 +302,40 @@ def _record_phase(state, label, result, ledger):
         {"phase": label, **event} for event in call["cap_events"]
     )
     state["costs"] = ledger.summary()
+    history = result.get("provider_history", []) if isinstance(result, dict) else []
+    for decision in history:
+        if isinstance(decision, dict):
+            state.setdefault("provider_history", []).append(dict(decision))
     for warning in result.get("warnings", []) if isinstance(result, dict) else []:
         if warning not in state.setdefault("warnings", []):
             state["warnings"].append(warning)
+    if isinstance(result, dict):
+        distribution = result.get("epistemic_distribution")
+        if not isinstance(distribution, dict):
+            distribution = result.get("epistemic_labels")
+        if isinstance(distribution, dict):
+            state["epistemic_labels"] = distribution
+
+
+def _provider_call_args(args, role, explicit_cmd):
+    """Return the registry controls shared by every invocation of *role*."""
+    forced = getattr(args, "_force_providers", {})
+    return {
+        "explicit_cmd": explicit_cmd,
+        "force": bool(getattr(args, "force", False)),
+        "force_provider": forced.get(role),
+    }
+
+
+def _provider_history_from_group_results(group_results, phase):
+    """Flatten concurrent phase decisions in stable group order."""
+    history = []
+    for index in sorted(group_results):
+        result = group_results[index].get(phase) or {}
+        for decision in result.get("provider_history", []):
+            if isinstance(decision, dict):
+                history.append(dict(decision))
+    return history
 
 
 def _normalize_findings(findings, state=None):
@@ -343,6 +379,11 @@ def _replace_gate_finding(findings, gate_finding):
     ] + [gate_finding]
 
 
+def _without_gate_findings(findings):
+    """Discard synthetic gate evidence after objective verification passes."""
+    return [finding for finding in findings if not finding.get("gate")]
+
+
 # --- partition & concurrent batches (R7) -------------------------------------
 
 def _partition_findings_by_file(findings):
@@ -383,7 +424,7 @@ def _partition_findings_by_file(findings):
 
 def _run_concurrent_fix_verify_round(
     findings, dev_cmd, review_cmd, workdir, feature, loop_n,
-    timeout, providers, execution, ledger, verification_cmd,
+    timeout, execution, ledger, verification_cmd,
     branch_point, max_workers, out_dir, state, args,
 ):
     """Run one FIX-to-VERIFY round concurrently in isolated worktrees.
@@ -417,7 +458,8 @@ def _run_concurrent_fix_verify_round(
 
             fix = phase_fix.run_fix(
                 group, dev_cmd, str(wt_path), timeout,
-                feature, loop_n, providers,
+                feature, loop_n, getattr(args, "_provider_resolver", None),
+                **_provider_call_args(args, "dev", getattr(args, "dev_cmd", None)),
                 execution=execution, ledger=ledger,
             )
             # Record per-group fix artifact
@@ -430,15 +472,21 @@ def _run_concurrent_fix_verify_round(
 
             wt_diff = gitops.get_diff(str(wt_path), branch_point)
             verify = phase_verify.run_verify(
-                group, wt_diff, review_cmd, providers, jsonio,
+                group, wt_diff, review_cmd,
+                getattr(args, "_provider_resolver", None), jsonio,
                 timeout=timeout, workdir=str(wt_path),
                 branch_point=branch_point,
+                **_provider_call_args(
+                    args, "verify", getattr(args, "review_cmd", None)
+                ),
                 execution=execution, ledger=ledger,
             )
             _write_json(out_dir, f"04_verdict_{loop_n}_g{idx}.json", verify)
 
             return idx, {"fix": fix, "verify": verify,
                          "group_size": len(group), "branch": branch}
+        except NoProviderAvailable:
+            raise
         except Exception as exc:
             return idx, {"error": str(exc), "group_size": len(group)}
 
@@ -449,10 +497,16 @@ def _run_concurrent_fix_verify_round(
 
     try:
         # Run all groups concurrently (capped at max_workers).
+        provider_error = None
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_process_group, i, g): i for i, g in enumerate(groups)}
             for fut in concurrent.futures.as_completed(futs):
-                idx, result = fut.result()
+                try:
+                    idx, result = fut.result()
+                except NoProviderAvailable as exc:
+                    if provider_error is None:
+                        provider_error = exc
+                    continue
                 with lock:
                     group_results[idx] = result
 
@@ -467,6 +521,9 @@ def _run_concurrent_fix_verify_round(
                 gitops.cherry_pick(workdir, branch)
             except gitops.GitError as exc:
                 result["merge_error"] = str(exc)
+
+        if provider_error is not None:
+            raise provider_error
     finally:
         # ponytail: cleanup on any exit path (success, failure, interrupt).
         # Keep this outside the try body so an aggregate block is one shot.
@@ -514,6 +571,9 @@ def _run_concurrent_fix_verify_round(
         ],
         "group_errors": group_fix_errors,
         "concurrent": True, "workers": workers,
+        "provider_history": _provider_history_from_group_results(
+            group_results, "fix"
+        ),
     }
 
     # Combined verify artifact
@@ -527,6 +587,9 @@ def _run_concurrent_fix_verify_round(
         "verdict": all_verdict,
         "groups": len(groups),
         "concurrent": True, "workers": workers,
+        "provider_history": _provider_history_from_group_results(
+            group_results, "verify"
+        ),
     }
 
     return combined_fix, combined_verify
@@ -636,7 +699,9 @@ def _finish(args, workdir, feature, out_dir, state, verdict,
         str(Path(out_dir) / "final.md"), no_merge=args.no_merge,
     )
     findings = _normalize_findings(list(state.get("findings", [])), state)
-    distribution = jsonio.epistemic_distribution(findings)
+    distribution = state.get("epistemic_labels")
+    if not isinstance(distribution, dict):
+        distribution = jsonio.epistemic_distribution(findings)
     ledger = getattr(args, "_ledger", None)
     costs = ledger.summary() if ledger is not None else state.get("costs", {})
     final_extra = {
@@ -663,7 +728,13 @@ def _finish(args, workdir, feature, out_dir, state, verdict,
     }
     if fin.get("error"):
         final_extra["error"] = f"git finalize failed: {fin['error']}"
-    jsonio.write_final_json(out_dir, verdict, **final_extra)
+    final_payload = runner.ensure_final_payload(
+        verdict=verdict,
+        provider_history=state.get("provider_history", []),
+        **final_extra,
+    )
+    final_payload.pop("verdict", None)
+    jsonio.write_final_json(out_dir, verdict, **final_payload)
     if fin["exit_code"] != 0:
         # Do NOT mark 'done': leave the run resumable so finalize is retried.
         state["error"] = f"git finalize: {fin.get('error', 'unknown error')}"
@@ -684,7 +755,8 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
               workdir, feature, out_dir, state):
     """Run (or resume) the full v4 workflow. Returns the process exit code."""
     completed = state.setdefault("completed", [])
-    ledger = args._ledger
+    ledger = getattr(args, "_ledger", None) or CostLedger()
+    args._ledger = ledger
     execution = _execution_settings(args)
 
     # A finished run must not be re-entered: on APPROVED the loop branch was
@@ -719,15 +791,18 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
         _banner(f"LOOP BRANCH  {setup['branch']}  (from {parent_branch})")
 
     branch_point = state["branch_point"]
-    spec_text = args._spec_text
+    spec_text = getattr(args, "_spec_text", None)
+    if spec_text is None:
+        spec_text = Path(args.spec).read_text(encoding="utf-8")
     jsonio.save_artifact(out_dir, "00_spec.txt", spec_text)
-    verification_cmd = args.test_cmd or args.build_cmd
+    build_verification_cmd = args.build_cmd
+    fix_verification_cmd = args.test_cmd or args.build_cmd
 
     # Validate the project and configured command before the first model call.
     if "pre_build_gate" in completed:
         pre_gate = _read_json(Path(out_dir) / "00_pre_build_gate.json") or {}
     else:
-        pre_gate = gates.pre_build_gate(workdir, verification_cmd)
+        pre_gate = gates.pre_build_gate(workdir, build_verification_cmd)
         _write_json(out_dir, "00_pre_build_gate.json", pre_gate)
         state.setdefault("gates", []).append(pre_gate)
         if not pre_gate.get("ok", False):
@@ -742,7 +817,9 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
     if "build" not in completed:
         _banner("BUILD  (DEV)")
         result = phase_build.run_build(
-            spec_text, dev_cmd, workdir, args.timeout, feature, providers,
+            spec_text, dev_cmd, workdir, args.timeout, feature,
+            getattr(args, "_provider_resolver", None),
+            **_provider_call_args(args, "dev", getattr(args, "dev_cmd", None)),
             execution=execution, ledger=ledger,
         )
         _record_phase(state, "build", result, ledger)
@@ -754,14 +831,14 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
 
     # A post-build failure is actionable evidence, not a terminal rejection.
     post_build_failed = False
-    if verification_cmd:
+    if build_verification_cmd:
         if "post_build_gate" in completed:
             build_gate = _read_json(
                 Path(out_dir) / "01_post_build_gate.json"
             ) or {}
         else:
             build_gate = gates.post_build_gate(
-                workdir, verification_cmd, timeout=args.timeout
+                workdir, build_verification_cmd, timeout=args.timeout
             )
             _write_json(out_dir, "01_post_build_gate.json", build_gate)
             state.setdefault("gates", []).append(build_gate)
@@ -807,8 +884,12 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             )
         _banner("REVIEW  (CRITIC)")
         review = phase_review.run_review(
-            diff, review_cmd, providers, jsonio, workdir=workdir,
+            diff, review_cmd, getattr(args, "_provider_resolver", None), jsonio,
+            workdir=workdir,
             branch_point=branch_point, execution=execution, ledger=ledger,
+            **_provider_call_args(
+                args, "review", getattr(args, "review_cmd", None)
+            ),
         )
         _record_phase(state, "review", review, ledger)
         _write_json(out_dir, "02_review.json", review)
@@ -827,9 +908,31 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
     conditions = []
     loops_run = state.get("loop", 0)
 
+    # A review can approve without entering FIX.  An explicitly configured
+    # test gate still has to run once against that approved build.
+    if approved and args.test_cmd:
+        gate_name = "post_review_test_gate"
+        gate_path = Path(out_dir) / "02_post_review_test_gate.json"
+        if gate_name in completed:
+            final_gate = _read_json(gate_path) or {}
+        else:
+            final_gate = gates.post_fix_gate(
+                workdir, args.test_cmd, timeout=args.timeout
+            )
+            _write_json(out_dir, gate_path.name, final_gate)
+            state.setdefault("gates", []).append(final_gate)
+            if final_gate.get("infra"):
+                return _phase_failed(gate_name, final_gate, state, out_dir)
+            _mark(state, out_dir, gate_name)
+        if not final_gate.get("ok", False):
+            findings = [_gate_finding(final_gate, "post_review")]
+            approved = False
+
     # R5 complexity cap for concurrent workers.
     complexity = state.get("complexity", {})
-    max_concurrent = complexity.get("recommended_agents", args.max_agents)
+    max_concurrent = complexity.get(
+        "recommended_agents", getattr(args, "max_agents", 6)
+    )
 
     for n in range(1, args.max_loops + 1):
         if approved or not findings:
@@ -839,7 +942,9 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
 
         # --- Determine whether to run concurrent batches ---
         groups = _partition_findings_by_file(findings)
-        use_concurrent = len(groups) > 1 and not (
+        use_concurrent = len(groups) > 1 and not any(
+            finding.get("gate") for finding in findings
+        ) and not (
             f"fix_{n}" in completed or f"verify_{n}" in completed
         )
 
@@ -847,8 +952,8 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             # --- Concurrent FIX+VERIFY round ---
             fix, verify = _run_concurrent_fix_verify_round(
                 findings, dev_cmd, review_cmd, workdir, feature, n,
-                args.timeout, providers, execution, ledger,
-                verification_cmd, branch_point,
+                args.timeout, execution, ledger,
+                fix_verification_cmd, branch_point,
                 max_concurrent, out_dir, state, args,
             )
             _record_phase(state, f"fix_{n}", fix, ledger)
@@ -885,7 +990,11 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             _banner(f"FIX  (round {n}/{args.max_loops})")
             _normalize_findings(findings, state)
             fix = phase_fix.run_fix(
-                findings, dev_cmd, workdir, args.timeout, feature, n, providers,
+                findings, dev_cmd, workdir, args.timeout, feature, n,
+                getattr(args, "_provider_resolver", None),
+                **_provider_call_args(
+                    args, "dev", getattr(args, "dev_cmd", None)
+                ),
                 execution=execution, ledger=ledger,
             )
             _record_phase(state, f"fix_{n}", fix, ledger)
@@ -896,14 +1005,14 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
 
         gate_blocked = False
         gate_resolved = False
-        if verification_cmd:
+        if fix_verification_cmd:
             gate_name = f"post_fix_gate_{n}"
             gate_path = Path(out_dir) / f"03_post_fix_gate_{n}.json"
             if gate_name in completed:
                 fix_gate = _read_json(gate_path) or {}
             else:
                 fix_gate = gates.post_fix_gate(
-                    workdir, verification_cmd, timeout=args.timeout
+                    workdir, fix_verification_cmd, timeout=args.timeout
                 )
                 _write_json(out_dir, gate_path.name, fix_gate)
                 state.setdefault("gates", []).append(fix_gate)
@@ -929,10 +1038,7 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
                     finding.get("id") == _GATE_FINDING_ID
                     for finding in findings
                 )
-                findings = [
-                    finding for finding in findings
-                    if finding.get("id") != _GATE_FINDING_ID
-                ]
+                findings = _without_gate_findings(findings)
                 state["findings"] = findings
                 _write_json(out_dir, fix_path.name, fix)
 
@@ -966,8 +1072,12 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
             _banner(f"VERIFY  (round {n}/{args.max_loops})")
             diff = gitops.get_diff(workdir, branch_point)
             verify = phase_verify.run_verify(
-                findings, diff, review_cmd, providers, jsonio,
+                findings, diff, review_cmd,
+                getattr(args, "_provider_resolver", None), jsonio,
                 workdir=workdir, branch_point=branch_point,
+                **_provider_call_args(
+                    args, "verify", getattr(args, "review_cmd", None)
+                ),
                 execution=execution, ledger=ledger,
             )
             _record_phase(state, f"verify_{n}", verify, ledger)
@@ -1005,8 +1115,17 @@ def _pipeline(args, dev_cmd, review_cmd, arbiter_cmd,
                 _banner("ARBITER  (JUDGE)")
                 _normalize_findings(findings, state)
                 arb = phase_arbiter.run_arbiter(
-                    findings, dev_cmd, review_cmd, arbiter_cmd, providers
+                    findings, dev_cmd, review_cmd, arbiter_cmd,
+                    getattr(args, "_provider_resolver", None),
+                    workdir=workdir,
+                    timeout=args.timeout,
+                    **_provider_call_args(
+                        args, "arbiter", getattr(args, "arbiter_cmd", None)
+                    ),
+                    execution=execution,
+                    ledger=ledger,
                 )
+                _record_phase(state, "arbiter", arb, ledger)
                 _write_json(out_dir, "05_arbiter.json", arb)
                 if arb["exit_code"] != 0:
                     return _phase_failed("arbiter", arb, state, out_dir)
@@ -1064,6 +1183,29 @@ def _non_negative_int(value):
     return ivalue
 
 
+def _force_provider_value(value):
+    """argparse type for repeatable ``ROLE:ALIAS`` provider overrides."""
+    role, separator, alias = value.partition(":")
+    role = role.strip().lower()
+    alias = alias.strip()
+    if not separator or role not in _FORCE_PROVIDER_ROLES or not alias:
+        allowed = ", ".join(sorted(_FORCE_PROVIDER_ROLES))
+        raise argparse.ArgumentTypeError(
+            f"expected <role>:<alias> with role in: {allowed}"
+        )
+    return role, alias
+
+
+def _force_provider_map(values):
+    """Validate repeatable overrides and return one alias per role."""
+    result = {}
+    for role, alias in values:
+        if role in result:
+            raise ValueError(f"--force-provider specified more than once for {role}")
+        result[role] = alias
+    return result
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Adversarial Code Loop v4 "
@@ -1076,6 +1218,25 @@ def build_parser():
                    help=f"CRITIC/VERIFIER command (default: $ACL_REVIEW_CMD or '{DEFAULT_REVIEW_CMD}')")
     p.add_argument("--arbiter-cmd", default=None,
                    help="JUDGE command (optional; default: $ACL_ARBITER_CMD; unset = no arbiter)")
+    p.add_argument(
+        "--provider-config",
+        default=None,
+        metavar="PATH",
+        help="provider registry YAML (env: ADVERSARIAL_PROVIDER_CONFIG)",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="skip quota checks and select each role's primary provider",
+    )
+    p.add_argument(
+        "--force-provider",
+        action="append",
+        default=[],
+        type=_force_provider_value,
+        metavar="ROLE:ALIAS",
+        help="force an alias for one role; repeat for multiple roles",
+    )
     p.add_argument("--max-loops", type=_positive_int, default=3)
     p.add_argument("--no-arbiter", action="store_true", help="Skip the arbiter")
     p.add_argument("--timeout", type=_positive_int, default=600,
@@ -1130,6 +1291,26 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
+    try:
+        args._force_providers = _force_provider_map(args.force_provider)
+        args._provider_config = load_provider_config(args.provider_config)
+        if args._provider_config is None:
+            args._provider_resolver = None
+        else:
+            if not args._provider_config.quota_cmd:
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_QUOTA_CMD_REQUIRED",
+                    "quota_cmd is required when the code loop uses a provider registry",
+                )
+            # One resolver owns the process-scoped quota cache and selection
+            # history for every phase, retry, concurrent group, and plan step.
+            args._provider_resolver = QuotaResolver(
+                args._provider_config, args._provider_config.quota_cmd
+            )
+    except (ProviderConfigError, TypeError, ValueError) as exc:
+        print(f"X invalid provider configuration: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
     workdir = str(Path(args.workdir).resolve())
     if not os.path.isdir(workdir):
         print(f"X Workdir not found: {args.workdir}")
@@ -1181,15 +1362,26 @@ def main(argv=None):
     if not ok:
         print(f"X {info}")
         return EXIT_INFRA
-    dev_cmd = resolve_role_cmd(
-        "dev", args.dev_cmd, "ACL_DEV_CMD", DEFAULT_DEV_CMD
-    )
-    review_cmd = resolve_role_cmd(
-        "review", args.review_cmd, "ACL_REVIEW_CMD", DEFAULT_REVIEW_CMD
-    )
-    arbiter_cmd = (
-        args.arbiter_cmd or os.environ.get("ACL_ARBITER_CMD") or ""
-    ).strip()
+    if args._provider_config is None:
+        dev_cmd = resolve_role_cmd(
+            "dev", args.dev_cmd, "ACL_DEV_CMD", DEFAULT_DEV_CMD
+        )
+        review_cmd = resolve_role_cmd(
+            "review", args.review_cmd, "ACL_REVIEW_CMD", DEFAULT_REVIEW_CMD
+        )
+        arbiter_cmd = (
+            args.arbiter_cmd or os.environ.get("ACL_ARBITER_CMD") or ""
+        ).strip()
+    else:
+        # Registry commands are deliberately not resolved here: each phase
+        # must consult the shared quota resolver immediately before execution.
+        dev_cmd = (args.dev_cmd or "").strip()
+        review_cmd = (args.review_cmd or "").strip()
+        arbiter_cmd = (args.arbiter_cmd or "").strip()
+        if not arbiter_cmd and args._provider_config.roles.get("arbiter"):
+            # Only used as an enablement sentinel; run_phase_cmd selects the
+            # actual command after quota resolution.
+            arbiter_cmd = args._provider_config.roles["arbiter"][0].command
 
     args._spec_text = spec_text
     args._ledger = _restore_ledger(state)
@@ -1200,6 +1392,7 @@ def main(argv=None):
     state.setdefault("attempts", [])
     state.setdefault("calls", [])
     state.setdefault("warnings", [])
+    state.setdefault("provider_history", [])
     cap_events = state.setdefault("cap_events", [])
     if not any(
         isinstance(event, dict) and event.get("phase") == "preflight"
@@ -1209,10 +1402,11 @@ def main(argv=None):
     state.setdefault("gates", [])
     state["costs"] = args._ledger.summary()
 
+    provider_mode = "registry" if args._provider_resolver is not None else "legacy"
     print(f"\n{'#' * 60}\n  ADVERSARIAL CODE LOOP v4\n"
           f"  Spec: {args.spec}\n  Feature: {feature}\n"
           f"  Max loops: {args.max_loops}\n"
-          f"  DEV: {dev_cmd}\n  REVIEW: {review_cmd}\n{'#' * 60}")
+          f"  Provider mode: {provider_mode}\n{'#' * 60}")
 
     try:
         code = _pipeline(
@@ -1227,6 +1421,24 @@ def main(argv=None):
         state["costs"] = args._ledger.summary()
         _write_json(out_dir, "state.json", state)
         code = EXIT_INFRA
+    except NoProviderAvailable as exc:
+        print(f"X no provider available for role '{exc.role}'", file=sys.stderr)
+        aliases = set(exc.snapshots) | set(exc.reasons)
+        for alias in sorted(aliases):
+            snapshot = json.dumps(
+                exc.snapshots.get(alias, {}), sort_keys=True, default=str
+            )
+            reason = exc.reasons.get(alias, "ineligible")
+            print(
+                f"  {alias}: {reason}; snapshot={snapshot}", file=sys.stderr
+            )
+        state["error"] = str(exc)
+        state["provider_snapshots"] = json.loads(
+            json.dumps(exc.snapshots, default=str)
+        )
+        state["costs"] = args._ledger.summary()
+        _write_json(out_dir, "state.json", state)
+        code = EXIT_REJECTED
     except gitops.GitError as exc:
         print(f"\nX git error: {exc}")
         state["error"] = str(exc)

@@ -12,7 +12,13 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from scripts.phases.runtime import merge_runtime, merge_warnings
+from adversarial_common import NoProviderAvailable, run_phase_cmd
+from scripts.phases.runtime import (
+    merge_provider_history,
+    merge_runtime,
+    merge_warnings,
+    raise_no_provider_available,
+)
 
 __all__ = ["run_verify"]
 
@@ -69,11 +75,14 @@ def run_verify(
     findings: list,
     diff_text: str,
     review_cmd: str,
-    providers: Any,
+    resolver: Any,
     jsonio: Any,
     timeout: int = 600,
     workdir: str = "",
     branch_point: str = "",
+    explicit_cmd: str | None = None,
+    force: bool = False,
+    force_provider: str | None = None,
     execution: Mapping[str, Any] | None = None,
     ledger: Any = None,
 ) -> dict:
@@ -116,6 +125,7 @@ def run_verify(
     )
 
     runtime_calls = []
+    provider_results = []
     parse_warnings = []
 
     def _attempt(prompt_text):
@@ -124,10 +134,25 @@ def run_verify(
             execution_args["phase"] = "verify"
         if ledger is not None:
             execution_args["ledger"] = ledger
-        provider_result = providers.run_cmd(
-            review_cmd, stdin_text=prompt_text, role="verifier",
-            timeout=timeout, cwd=workdir, **execution_args,
+        command_args = {}
+        if resolver is None and explicit_cmd is None:
+            command_args["cmd"] = review_cmd
+        provider_result = run_phase_cmd(
+            phase_name="verify",
+            role="verify",
+            workdir=workdir,
+            resolver=resolver,
+            explicit_cmd=explicit_cmd,
+            force=force,
+            force_provider=force_provider,
+            stdin_text=prompt_text,
+            timeout=timeout,
+            persona="verifier",
+            **command_args,
+            **execution_args,
         )
+        raise_no_provider_available(provider_result, "verify")
+        provider_results.append(provider_result)
         stdout, stderr, code = provider_result[:3]
         metadata = getattr(provider_result, "metadata", {})
         runtime_calls.append(
@@ -144,6 +169,7 @@ def run_verify(
             return {
                 "phase": "verify", "exit_code": 1, "error": err,
                 "execution": merge_runtime(runtime_calls),
+                "provider_history": merge_provider_history(provider_results),
             }
         if not _validate(payload):
             payload, err, stdout = _attempt(
@@ -154,6 +180,7 @@ def run_verify(
                 return {
                     "phase": "verify", "exit_code": 1, "error": err,
                     "execution": merge_runtime(runtime_calls),
+                    "provider_history": merge_provider_history(provider_results),
                 }
             if not _validate(payload):
                 return {
@@ -162,6 +189,7 @@ def run_verify(
                     "error": "invalid JSON after retry", "stdout": stdout,
                     "warnings": parse_warnings,
                     "execution": merge_runtime(runtime_calls),
+                    "provider_history": merge_provider_history(provider_results),
                 }
         return {
             "phase": "verify", "exit_code": 0,
@@ -172,6 +200,9 @@ def run_verify(
             "stdout": stdout,
             "warnings": merge_warnings(payload, parse_warnings),
             "execution": merge_runtime(runtime_calls),
+            "provider_history": merge_provider_history(provider_results),
         }
+    except NoProviderAvailable:
+        raise
     except Exception as exc:
         return {"phase": "verify", "exit_code": 1, "error": str(exc)}

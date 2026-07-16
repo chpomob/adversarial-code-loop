@@ -180,13 +180,89 @@ def test_build_and_test_commands_use_independent_gates(tmp_path, monkeypatch):
     result = loop._pipeline(
         args, "dev", "review", "", str(tmp_path), "test", out_dir, state
     )
+    resumed_result = loop._pipeline(
+        args, "dev", "review", "", str(tmp_path), "test", out_dir, state
+    )
 
     assert result == loop.EXIT_APPROVED
+    assert resumed_result == loop.EXIT_APPROVED
     assert calls == {
         "pre": ["build-check"],
         "build": ["build-check"],
         "test": ["test-check"],
     }
+    assert "post_review_test_gate" in state["completed"]
+    assert (out_dir / "02_post_review_test_gate.json").exists()
+
+
+def test_provider_exhaustion_preserves_completed_concurrent_group(
+        tmp_path, monkeypatch):
+    findings = [
+        {"id": "A1", "file": "one.py"},
+        {"id": "A2", "file": "two.py"},
+    ]
+    cherry_picked = []
+
+    monkeypatch.setattr(loop.gitops, "create_worktree", lambda *args: None)
+    monkeypatch.setattr(loop.gitops, "remove_worktree", lambda *args: None)
+    monkeypatch.setattr(loop.gitops, "delete_branch", lambda *args: None)
+    monkeypatch.setattr(loop.gitops, "checkout", lambda *args: None)
+    monkeypatch.setattr(loop.gitops, "get_diff", lambda *args: "diff")
+    monkeypatch.setattr(
+        loop.gitops, "cherry_pick",
+        lambda _workdir, branch: cherry_picked.append(branch),
+    )
+
+    def run_fix(group, *args, **kwargs):
+        if group[0]["id"] == "A1":
+            raise loop.NoProviderAvailable("dev", {}, {})
+        return {"exit_code": 0, "commit_sha": "abc"}
+
+    monkeypatch.setattr(loop.phase_fix, "run_fix", run_fix)
+    monkeypatch.setattr(
+        loop.phase_verify, "run_verify",
+        lambda group, *args, **kwargs: {
+            "exit_code": 0,
+            "verdict": "APPROVE",
+            "results": [{"id": group[0]["id"], "status": "resolved"}],
+        },
+    )
+
+    args = SimpleNamespace(
+        max_loops=1, dev_cmd=None, review_cmd=None,
+        _provider_resolver=object(), _force_providers={}, force=False,
+    )
+    state = {"branch": "loop/test"}
+
+    try:
+        loop._run_concurrent_fix_verify_round(
+            findings, "dev", "review", str(tmp_path), "test", 1,
+            10, {}, loop.CostLedger(), None, "base", 2,
+            tmp_path, state, args,
+        )
+    except loop.NoProviderAvailable:
+        pass
+    else:
+        raise AssertionError("provider exhaustion was not propagated")
+
+    assert cherry_picked == ["loop/test/fix-1/g1"]
+
+
+def test_record_phase_persists_epistemic_distribution():
+    state = {}
+    distribution = {
+        "confidence": {"high": 1, "medium": 0, "low": 0},
+        "basis": {"spec": 0, "code": 1, "inference": 0, "external": 0},
+    }
+
+    loop._record_phase(
+        state,
+        "review",
+        {"exit_code": 0, "epistemic_distribution": distribution},
+        loop.CostLedger(),
+    )
+
+    assert state["epistemic_labels"] == distribution
 
 
 def test_test_only_command_runs_once_after_approval(tmp_path, monkeypatch):

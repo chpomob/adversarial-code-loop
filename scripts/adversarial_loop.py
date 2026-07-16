@@ -4,7 +4,8 @@
 ``adversarial_loop_v4`` is the sole implementation. Importers of the
 historical ``adversarial_loop`` module receive that module directly so
 monkeypatching and private helper imports continue to behave exactly as they
-did before the implementations were consolidated.
+did before the implementations were consolidated.  This includes the provider
+registry CLI and its process-scoped quota resolver.
 """
 from importlib import import_module
 import sys

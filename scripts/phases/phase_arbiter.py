@@ -8,9 +8,15 @@ falls back to scanning a ``VERDICT:`` line and bullet points.
 """
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
-from adversarial_common import jsonio
+from adversarial_common import NoProviderAvailable, jsonio, run_phase_cmd
+from scripts.phases.runtime import (
+    merge_provider_history,
+    raise_no_provider_available,
+    runtime_metadata,
+)
 
 __all__ = ["run_arbiter"]
 
@@ -76,7 +82,15 @@ def run_arbiter(
     dev_cmd: str,
     review_cmd: str,
     arbiter_cmd: str,
-    providers: Any,
+    resolver: Any = None,
+    *,
+    workdir: str = "",
+    timeout: int = 600,
+    explicit_cmd: str | None = None,
+    force: bool = False,
+    force_provider: str | None = None,
+    execution: Mapping[str, Any] | None = None,
+    ledger: Any = None,
 ) -> dict:
     """Run the ARBITER model with unresolved disputes.
 
@@ -98,15 +112,40 @@ def run_arbiter(
             "\"minimal_patch\": \"\", \"summary\": \"...\"}.\n\n"
             f"Disputed findings:\n```json\n{json.dumps(findings, indent=2)}\n```"
         )
-        stdout, stderr, code = providers.run_cmd(
-            arbiter_cmd, stdin_text=prompt, role="judge",
+        execution_args = dict(execution or {})
+        if execution is not None or ledger is not None:
+            execution_args["phase"] = "arbiter"
+        if ledger is not None:
+            execution_args["ledger"] = ledger
+        command_args = {}
+        if resolver is None and explicit_cmd is None:
+            command_args["cmd"] = arbiter_cmd
+        provider_result = run_phase_cmd(
+            phase_name="arbiter",
+            role="arbiter",
+            workdir=workdir,
+            resolver=resolver,
+            explicit_cmd=explicit_cmd,
+            force=force,
+            force_provider=force_provider,
+            stdin_text=prompt,
+            timeout=timeout,
+            persona="judge",
+            **command_args,
+            **execution_args,
         )
+        raise_no_provider_available(provider_result, "arbiter")
+        stdout, stderr, code = provider_result[:3]
+        runtime = runtime_metadata(provider_result)
+        provider_history = merge_provider_history([provider_result])
         if code != 0:
             return {
                 "phase": "arbiter",
                 "exit_code": 1,
                 "error": f"ARBITER exited {code}: {(stderr or '')[:200]}",
                 "stdout": stdout,
+                "execution": runtime,
+                "provider_history": provider_history,
             }
         parsed = _parse(stdout)
         return {
@@ -114,6 +153,10 @@ def run_arbiter(
             "exit_code": 0,
             **parsed,
             "stdout": stdout,
+            "execution": runtime,
+            "provider_history": provider_history,
         }
+    except NoProviderAvailable:
+        raise
     except Exception as exc:
         return {"phase": "arbiter", "exit_code": 1, "error": str(exc)}
