@@ -247,7 +247,7 @@ python3 ~/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
 # so push --timeout up and keep the inner --hard-timeout >= the loop timeout.
 python3 ~/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py \
   --spec /tmp/spec.md --workdir /path/to/project \
-  --dev-cmd "python3 /home/chpo/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py --yolo --model best --timeout 900 --hard-timeout 2400 --max-turns 20" \
+  --dev-cmd "python3 /path/to/claude-tmux.py --model best --timeout 900 --hard-timeout 2400 --max-turns 20" \
   --timeout 2400
 
 # GLM-5.2 DEV + DeepSeek REVIEW (thinking high on both). No Claude quota needed.
@@ -278,6 +278,12 @@ thoroughly and reliably returns JSON; DeepSeek REVIEW is slower but finds more f
 Claude (via tmux) is the most thorough reviewer but slowest and quota-bound. Codex
 FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs) — check
 `git diff --stat` after every loop before assuming REJECT means the code is wrong.
+
+**Future — quota-aware provider selection (not yet implemented):** The adversarial
+pipeline is designed to be model-agnostic. A proposed `--provider-config` flag would
+load real-time quota data and auto-select commands per role. See
+`references/quota-aware-provider-registry.md` for the design spec and
+`/home/chpo/.config/adversarial/providers.yaml` for the user's personal config.
 
 ## Pitfalls
 
@@ -468,9 +474,11 @@ FIX often *cascades* beyond spec scope (migrates consumers, fixes adjacent bugs)
     work.
 26. **claude-tmux `--cwd` is REQUIRED when `--workdir` differs from the script's CWD (plan mode).** The adversarial loop script runs from `adversarial-code-loop/scripts/`, but reviews inspect the `--workdir` tree. claude-tmux spawns a tmux session whose CWD defaults to the *subprocess* CWD — which is the loop script's directory, NOT `--workdir`. Without `--cwd`, the reviewer runs `git diff` in the wrong repo and reports an empty diff even though the BUILD commit exists on the correct branch in `--workdir`. **Symptom:** REVIEW exits with 0 but findings say "the commit under review is empty" or "the worktree is checked out on `main`" — check whether claude-tmux has `--cwd`. **Fix:** always pass `--cwd <workdir>` to claude-tmux in the `--review-cmd` (and `--dev-cmd` if claude-tmux is the DEV). The claude-tmux `--cwd` flag translates to tmux's `-c` / `default-command` flag, setting the shell's working directory inside the session. Example:
    ```bash
-   --review-cmd "python3 /path/to/claude-tmux.py --yolo --model best --timeout 900 --hard-timeout 2400 --cwd /home/user/plugins/hermes-quota-status"
+   --review-cmd "python3 /path/to/claude-tmux.py --model best --timeout 900 --hard-timeout 2400 --cwd /home/user/plugins/hermes-quota-status"
    ```
    The `claude-tmux-wrapper` skill documents `--cwd` in its flag table but the adversarial loop pitfall #26 is the right place to warn callers. Without this, the first plan step always fails with an empty-diff finding and wastes a full loop round before you debug it.
+
+26b. **`--yolo` flag does NOT exist in claude-tmux wrapper v1.** The `--dangerously-skip-permissions` behaviour is the DEFAULT in that version (danger=True set in the Python code, no flag needed). Passing `--yolo` causes argparse exit code 2 (unknown argument). **Symptom:** CHALLENGE phase fails with "review exited 2: usage: claude-tmux.py [-h] [--model MODEL]...". **Fix:** omit `--yolo` — just use `--model sonnet --timeout 900 --hard-timeout 1800`. Validated on the v1 wrapper at /home/chpo/claude-tmux-wrapper/claude-tmux.py (342 lines, no `--yolo` in argparse). Also update any hardcoded example commands in the SKILL.md that include `--yolo`.
 
 27. **`--plan` file list format: one line, comma-separated.** Multi-line bullet lists
     under `Files:` and `Dependencies:` are NOT parsed by `parse_plan()`. Bad:
